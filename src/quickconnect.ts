@@ -1,4 +1,5 @@
 import { requestUrl } from "obsidian";
+import { debugLog } from "./debug";
 
 interface QCServerInfo {
   command: string;
@@ -37,6 +38,7 @@ interface ResolvedNAS {
 }
 
 export async function resolveQuickConnect(quickConnectId: string): Promise<ResolvedNAS> {
+  debugLog(`QC: resolving "${quickConnectId}"`);
   const body = JSON.stringify([
     {
       version: 1,
@@ -137,13 +139,18 @@ export async function resolveQuickConnect(quickConnectId: string): Promise<Resol
     throw new Error(`QuickConnect could not resolve "${quickConnectId}"`);
   }
 
+  debugLog(`QC: ${candidates.length} candidates built`);
+  candidates.forEach((c, i) => debugLog(`QC:   [${i}] ${c.https ? "https" : "http"}://${c.host}:${c.port}`));
+
   // SmartDNS hostnames are pre-validated by the QuickConnect API and have
   // valid wildcard certs. Use them directly without ping-pong testing.
   const smartDnsCandidates = candidates.filter(
     (c) => c.host.includes(".direct.quickconnect.to")
   );
   if (smartDnsCandidates.length > 0) {
-    return smartDnsCandidates[0];
+    const chosen = smartDnsCandidates[0];
+    debugLog(`QC: using SmartDNS ${chosen.https ? "https" : "http"}://${chosen.host}:${chosen.port}`);
+    return chosen;
   }
 
   // Ping-pong test remaining candidates

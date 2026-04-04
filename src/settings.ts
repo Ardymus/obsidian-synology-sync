@@ -1,6 +1,7 @@
-import { App, PluginSettingTab, Setting, Notice } from "obsidian";
+import { App, PluginSettingTab, Setting, Notice, Modal } from "obsidian";
 import type SynologySync from "./main";
 import { resolveQuickConnect } from "./quickconnect";
+import { getDebugLog, clearDebugLog } from "./debug";
 
 export interface SynologySyncSettings {
   connectionType: "quickconnect" | "direct";
@@ -324,5 +325,70 @@ export class SynologySyncSettingTab extends PluginSettingTab {
           await this.plugin.runSync();
         })
       );
+
+    // Debug
+    containerEl.createEl("h3", { text: "Troubleshooting" });
+
+    new Setting(containerEl)
+      .setName("Debug log")
+      .setDesc("View detailed connection and auth logs (credentials are redacted)")
+      .addButton((btn) =>
+        btn.setButtonText("Show log").onClick(() => {
+          new DebugLogModal(this.app, getDebugLog()).open();
+        })
+      )
+      .addButton((btn) =>
+        btn.setButtonText("Clear").onClick(() => {
+          clearDebugLog();
+          new Notice("Debug log cleared");
+        })
+      );
+  }
+}
+
+class DebugLogModal extends Modal {
+  private logContent: string;
+
+  constructor(app: App, logContent: string) {
+    super(app);
+    this.logContent = logContent || "(no log entries yet - try Browse or Sync first)";
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Synology Sync - Debug Log" });
+    contentEl.createEl("p", {
+      text: "Copy this log and share it for troubleshooting. Passwords and tokens are redacted.",
+      cls: "setting-item-description",
+    });
+
+    const pre = contentEl.createEl("pre", {
+      text: this.logContent,
+    });
+    pre.style.fontSize = "11px";
+    pre.style.lineHeight = "1.4";
+    pre.style.whiteSpace = "pre-wrap";
+    pre.style.wordBreak = "break-all";
+    pre.style.maxHeight = "400px";
+    pre.style.overflow = "auto";
+    pre.style.padding = "8px";
+    pre.style.borderRadius = "4px";
+    pre.style.backgroundColor = "var(--background-secondary)";
+
+    new Setting(contentEl)
+      .addButton((btn) =>
+        btn.setButtonText("Copy to clipboard").setCta().onClick(async () => {
+          await navigator.clipboard.writeText(this.logContent);
+          new Notice("Debug log copied to clipboard");
+        })
+      )
+      .addButton((btn) =>
+        btn.setButtonText("Close").onClick(() => this.close())
+      );
+  }
+
+  onClose() {
+    this.contentEl.empty();
   }
 }

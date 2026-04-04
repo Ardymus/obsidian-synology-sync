@@ -1,4 +1,5 @@
 import { requestUrl, RequestUrlResponse } from "obsidian";
+import { debugLog, redact } from "./debug";
 
 export interface FileInfo {
   path: string;
@@ -72,12 +73,32 @@ export class FileStation {
       }
     }
 
+    debugLog(`AUTH: baseUrl=${this.config.baseUrl}`);
+    debugLog(`AUTH: user=${this.config.username}`);
+    debugLog(`AUTH: password=${redact(this.config.password)}`);
+    debugLog(`AUTH: config.deviceToken=${redact(this.config.deviceToken)}`);
+    debugLog(`AUTH: config.deviceId=${redact(this.config.deviceId)}`);
+    debugLog(`AUTH: config.otpCode=${redact(this.config.otpCode)}`);
+    debugLog(`AUTH: params.device_id=${redact(params.device_id)}`);
+    debugLog(`AUTH: params.device_name=${params.device_name || "(unset)"}`);
+    debugLog(`AUTH: params.enable_device_token=${params.enable_device_token}`);
+    debugLog(`AUTH: params.otp_code=${params.otp_code ? "set" : "(unset)"}`);
+
     const resp = await requestUrl({
       url: this.url("", params),
       method: "GET",
     });
 
     const data = resp.json;
+    debugLog(`AUTH: response success=${data.success}`);
+    if (data.success) {
+      debugLog(`AUTH: response keys=${Object.keys(data.data || {}).join(",")}`);
+      debugLog(`AUTH: sid=${redact(data.data?.sid)}`);
+      debugLog(`AUTH: did=${redact(data.data?.did)}`);
+    } else {
+      debugLog(`AUTH: error=${JSON.stringify(data.error)}`);
+    }
+
     if (!data.success) {
       const code = data.error?.code;
       const hasDeviceToken = !!this.config.deviceToken;
