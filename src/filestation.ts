@@ -80,10 +80,12 @@ export class FileStation {
     const data = resp.json;
     if (!data.success) {
       const code = data.error?.code;
+      const hasDeviceToken = !!this.config.deviceToken;
+      const hasOtp = !!this.config.otpCode;
       const msg = code === 400 ? "Invalid credentials"
         : code === 401 ? "Account disabled"
         : code === 402 ? "Permission denied"
-        : code === 403 ? "2FA code required"
+        : code === 403 ? `2FA code required (deviceToken saved: ${hasDeviceToken}, otp provided: ${hasOtp})`
         : code === 404 ? "2FA code failed"
         : `Error code ${code}`;
       throw new Error(`Synology login failed: ${msg}`);
