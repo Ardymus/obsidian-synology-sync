@@ -137,7 +137,16 @@ export async function resolveQuickConnect(quickConnectId: string): Promise<Resol
     throw new Error(`QuickConnect could not resolve "${quickConnectId}"`);
   }
 
-  // Ping-pong test each candidate (timeout 3s per candidate)
+  // SmartDNS hostnames are pre-validated by the QuickConnect API and have
+  // valid wildcard certs. Use them directly without ping-pong testing.
+  const smartDnsCandidates = candidates.filter(
+    (c) => c.host.includes(".direct.quickconnect.to")
+  );
+  if (smartDnsCandidates.length > 0) {
+    return smartDnsCandidates[0];
+  }
+
+  // Ping-pong test remaining candidates
   for (const c of candidates) {
     const proto = c.https ? "https" : "http";
     const url = `${proto}://${c.host}:${c.port}/webman/pingpong.cgi?action=cors&quickconnect=true`;
