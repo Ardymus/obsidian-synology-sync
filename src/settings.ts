@@ -2,6 +2,7 @@ import { App, PluginSettingTab, Setting, Notice, Modal } from "obsidian";
 import type SynologySync from "./main";
 import { resolveQuickConnect } from "./quickconnect";
 import { getDebugLog, clearDebugLog } from "./debug";
+import { FileStation, FileInfo } from "./filestation";
 
 export interface SynologySyncSettings {
   connectionType: "quickconnect" | "direct";
@@ -236,10 +237,11 @@ export class SynologySyncSettingTab extends PluginSettingTab {
         btn.setButtonText("Browse").onClick(async () => {
           try {
             const fs = await this.plugin.getFileStation();
-            const shares = await fs.listShares();
-            const names = shares.map((s: any) => s.path).join("\n");
-            new Notice(`Shared folders:\n${names}`, 10000);
-            await fs.logout();
+            new FolderBrowserModal(this.app, fs, this.plugin.settings.remotePath, async (path) => {
+              this.plugin.settings.remotePath = path;
+              await this.plugin.saveSettings();
+              this.display();
+            }).open();
           } catch (e) {
             new Notice(`Browse failed: ${(e as Error).message}`);
           }
@@ -343,6 +345,139 @@ export class SynologySyncSettingTab extends PluginSettingTab {
           new Notice("Debug log cleared");
         })
       );
+  }
+}
+
+class FolderBrowserModal extends Modal {
+  private fs: FileStation;
+  private currentPath: string;
+  private pathHistory: string[];
+  private onSelect: (path: string) => void;
+
+  constructor(app: App, fs: FileStation, initialPath: string, onSelect: (path: string) => void) {
+    super(app);
+    this.fs = fs;
+    this.currentPath = initialPath || "";
+    this.pathHistory = [];
+    this.onSelect = onSelect;
+  }
+
+  async onOpen() {
+    await this.renderFolder();
+  }
+
+  onClose() {
+    this.contentEl.empty();
+    this.fs.logout().catch(() => {});
+  }
+
+  private async renderFolder() {
+    const { contentEl } = this;
+    contentEl.empty();
+
+    contentEl.createEl("h2", { text: "Select Folder" });
+
+    // Current path display
+    const pathBar = contentEl.createDiv({ cls: "synology-path-bar" });
+    pathBar.style.padding = "8px 12px";
+    pathBar.style.backgroundColor = "var(--background-secondary)";
+    pathBar.style.borderRadius = "4px";
+    pathBar.style.marginBottom = "12px";
+    pathBar.style.fontFamily = "var(--font-monospace)";
+    pathBar.style.fontSize = "13px";
+    pathBar.style.wordBreak = "break-all";
+    pathBar.setText(this.currentPath || "/");
+
+    // Action buttons row
+    const actions = contentEl.createDiv();
+    actions.style.display = "flex";
+    actions.style.gap = "8px";
+    actions.style.marginBottom = "12px";
+
+    if (this.currentPath) {
+      const upBtn = actions.createEl("button", { text: ".. Up" });
+      upBtn.addEventListener("click", async () => {
+        const parts = this.currentPath.split("/").filter(Boolean);
+        parts.pop();
+        this.currentPath = parts.length > 0 ? "/" + parts.join("/") : "";
+        await this.renderFolder();
+      });
+    }
+
+    const selectBtn = actions.createEl("button", {
+      text: this.currentPath ? `Select "${this.currentPath}"` : "Select a folder first",
+      cls: this.currentPath ? "mod-cta" : "",
+    });
+    if (this.currentPath) {
+      selectBtn.addEventListener("click", () => {
+        this.onSelect(this.currentPath);
+        new Notice(`Remote path set to: ${this.currentPath}`);
+        this.close();
+      });
+    } else {
+      selectBtn.disabled = true;
+    }
+
+    // Loading indicator
+    const list = contentEl.createDiv();
+    list.setText("Loading...");
+
+    try {
+      let items: any[];
+      if (!this.currentPath) {
+        // Root level: show shared folders
+        items = await this.fs.listShares();
+      } else {
+        items = await this.fs.listFolder(this.currentPath);
+      }
+
+      list.empty();
+
+      // Filter to directories only
+      const folders = items.filter((f: any) => f.isdir);
+      const files = items.filter((f: any) => !f.isdir);
+
+      if (folders.length === 0 && files.length === 0) {
+        list.createDiv({ text: "(empty folder)", cls: "setting-item-description" });
+      }
+
+      // Folders first (clickable)
+      for (const folder of folders) {
+        const row = list.createDiv();
+        row.style.padding = "6px 12px";
+        row.style.cursor = "pointer";
+        row.style.borderRadius = "4px";
+        row.style.display = "flex";
+        row.style.alignItems = "center";
+        row.style.gap = "8px";
+
+        row.createSpan({ text: "\uD83D\uDCC1" }); // folder emoji
+        row.createSpan({ text: folder.name || folder.path.split("/").pop() });
+
+        row.addEventListener("mouseenter", () => {
+          row.style.backgroundColor = "var(--background-modifier-hover)";
+        });
+        row.addEventListener("mouseleave", () => {
+          row.style.backgroundColor = "";
+        });
+        row.addEventListener("click", async () => {
+          this.currentPath = folder.path;
+          await this.renderFolder();
+        });
+      }
+
+      // Show file count (non-clickable, just for context)
+      if (files.length > 0) {
+        const fileCount = list.createDiv();
+        fileCount.style.padding = "6px 12px";
+        fileCount.style.opacity = "0.5";
+        fileCount.style.fontSize = "12px";
+        fileCount.setText(`+ ${files.length} file${files.length !== 1 ? "s" : ""}`);
+      }
+    } catch (e) {
+      list.empty();
+      list.createDiv({ text: `Error: ${(e as Error).message}`, cls: "setting-item-description" });
+    }
   }
 }
 
