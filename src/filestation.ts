@@ -67,28 +67,10 @@ export class FileStation {
     }
     // If an OTP code was provided (first-time 2FA setup)
     else if (this.config.otpCode) {
-      // DSM 7 two-step auth: first we need the JWT token from a 403 response,
-      // then we send OTP + JWT token together.
-      if (!this.config.twoFaToken) {
-        debugLog("AUTH: Step 1 - getting 2FA JWT token from initial login attempt");
-        const step1Resp = await requestUrl({
-          url: this.url("", params),
-          method: "GET",
-        });
-        const step1Data = step1Resp.json;
-        if (!step1Data.success && step1Data.error?.code === 403) {
-          this.config.twoFaToken = step1Data.error.errors?.token;
-          debugLog(`AUTH: Got 2FA JWT token: ${redact(this.config.twoFaToken, 10)}`);
-        }
-      }
-
       params.otp_code = this.config.otpCode;
       params.device_name = "Obsidian Synology Sync";
       if (this.config.deviceId) {
         params.device_id = this.config.deviceId;
-      }
-      if (this.config.twoFaToken) {
-        params["2FA_token"] = this.config.twoFaToken;
       }
     }
 
@@ -111,9 +93,16 @@ export class FileStation {
     const data = resp.json;
     debugLog(`AUTH: response success=${data.success}`);
     if (data.success) {
-      debugLog(`AUTH: response keys=${Object.keys(data.data || {}).join(",")}`);
-      debugLog(`AUTH: sid=${redact(data.data?.sid)}`);
-      debugLog(`AUTH: did=${redact(data.data?.did)}`);
+      const keys = Object.keys(data.data || {});
+      debugLog(`AUTH: response keys=${keys.join(",")}`);
+      for (const k of keys) {
+        const v = data.data[k];
+        if (typeof v === "string") {
+          debugLog(`AUTH: data.${k}=${k === "sid" || k === "synotoken" || k === "did" || k === "device_id" ? redact(v) : v}`);
+        } else {
+          debugLog(`AUTH: data.${k}=${JSON.stringify(v)}`);
+        }
+      }
     } else {
       debugLog(`AUTH: error=${JSON.stringify(data.error)}`);
     }
@@ -132,6 +121,24 @@ export class FileStation {
     }
 
     this.sid = data.data.sid;
+
+    // Query DSM version for debug
+    try {
+      const infoResp = await requestUrl({
+        url: this.url("", {
+          api: "SYNO.DSM.Info",
+          version: "2",
+          method: "getinfo",
+        }),
+        method: "GET",
+      });
+      if (infoResp.json?.success) {
+        const info = infoResp.json.data;
+        debugLog(`DSM: model=${info.model || "?"} version=${info.version_string || info.version || "?"} codepage=${info.codepage || "?"}`);
+      }
+    } catch {
+      debugLog("DSM: could not query version info");
+    }
 
     // DSM 7 returns the device token in different fields depending on version:
     // - 'did' (older DSM)
