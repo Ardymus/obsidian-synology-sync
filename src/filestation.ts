@@ -66,12 +66,10 @@ export class FileStation {
       params.device_name = "Obsidian Synology Sync";
     }
     // If an OTP code was provided (first-time 2FA setup)
+    // Do NOT send device_id here - let DSM generate one and return it
     else if (this.config.otpCode) {
       params.otp_code = this.config.otpCode;
       params.device_name = "Obsidian Synology Sync";
-      if (this.config.deviceId) {
-        params.device_id = this.config.deviceId;
-      }
     }
 
     debugLog(`AUTH: baseUrl=${this.config.baseUrl}`);
