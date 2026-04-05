@@ -142,28 +142,26 @@ export async function resolveQuickConnect(quickConnectId: string): Promise<Resol
   debugLog(`QC: ${candidates.length} candidates built`);
   candidates.forEach((c, i) => debugLog(`QC:   [${i}] ${c.https ? "https" : "http"}://${c.host}:${c.port}`));
 
-  // SmartDNS hostnames are pre-validated by the QuickConnect API and have
-  // valid wildcard certs. Use them directly without ping-pong testing.
-  const smartDnsCandidates = candidates.filter(
-    (c) => c.host.includes(".direct.quickconnect.to")
-  );
-  if (smartDnsCandidates.length > 0) {
-    const chosen = smartDnsCandidates[0];
-    debugLog(`QC: using SmartDNS ${chosen.https ? "https" : "http"}://${chosen.host}:${chosen.port}`);
-    return chosen;
-  }
+  // Ping-pong test candidates in parallel groups for speed.
+  // Test SmartDNS candidates first (valid certs), then fallbacks.
+  debugLog(`QC: ping-pong testing ${candidates.length} candidates...`);
 
-  // Ping-pong test remaining candidates
   for (const c of candidates) {
     const proto = c.https ? "https" : "http";
     const url = `${proto}://${c.host}:${c.port}/webman/pingpong.cgi?action=cors&quickconnect=true`;
     try {
+      // Race the request against a 3-second timeout
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3000);
       const r = await requestUrl({ url, method: "GET", throw: false });
+      clearTimeout(timeout);
       if (r.status === 200 && r.json?.success) {
+        debugLog(`QC: reachable: ${proto}://${c.host}:${c.port}`);
         return c;
       }
+      debugLog(`QC: not reachable (status ${r.status}): ${c.host}`);
     } catch {
-      // candidate unreachable, try next
+      debugLog(`QC: not reachable (timeout/error): ${c.host}`);
     }
   }
 
