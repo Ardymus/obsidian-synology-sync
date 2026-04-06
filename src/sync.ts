@@ -203,7 +203,8 @@ export class SyncEngine {
     if (existing instanceof TFile) {
       await this.vault.modifyBinary(existing, content);
     } else {
-      await this.vault.createBinary(relativePath, content);
+      // Use adapter.writeBinary for files outside the vault index (e.g. .obsidian/ configs)
+      await this.vault.adapter.writeBinary(relativePath, content);
     }
   }
 }
