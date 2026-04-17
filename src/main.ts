@@ -168,7 +168,15 @@ export default class SynologySync extends Plugin {
         excludePatterns,
       );
 
-      const result = await engine.sync(this.settings.deleteOrphans);
+      // Safety: suppress deleteOrphans on first sync to prevent wiping a
+      // populated remote when the local vault is empty (#1)
+      const isFirstSync = this.settings.lastSync === 0;
+      const deleteOrphans = isFirstSync ? false : this.settings.deleteOrphans;
+      if (isFirstSync && this.settings.deleteOrphans) {
+        new Notice("First sync: 'Delete remote orphans' disabled for safety. It will apply on subsequent syncs.");
+      }
+
+      const result = await engine.sync(deleteOrphans);
       this.settings.lastSync = Date.now();
       await this.saveSettings();
 
