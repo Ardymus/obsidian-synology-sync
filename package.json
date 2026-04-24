@@ -7,13 +7,21 @@
     "dev": "node esbuild.config.mjs",
     "build": "node esbuild.config.mjs production"
   },
-  "keywords": ["obsidian", "synology", "sync", "nas"],
+  "keywords": [
+    "obsidian",
+    "synology",
+    "sync",
+    "nas"
+  ],
   "author": "ForkTheGhost",
   "license": "MIT",
   "devDependencies": {
+    "@types/jest": "^30.0.0",
     "@types/node": "^22.0.0",
     "esbuild": "^0.25.0",
+    "jest": "^30.3.0",
     "obsidian": "latest",
+    "ts-jest": "^29.4.9",
     "typescript": "^5.7.0"
   }
 }
