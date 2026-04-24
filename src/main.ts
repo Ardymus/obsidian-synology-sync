@@ -58,6 +58,10 @@ export default class SynologySync extends Plugin {
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    if (!this.settings.syncIdentityId) {
+      this.settings.syncIdentityId = crypto.randomUUID();
+      await this.saveSettings();
+    }
   }
 
   async saveSettings() {
@@ -160,16 +164,19 @@ export default class SynologySync extends Plugin {
         .map((s) => s.trim())
         .filter((s) => s.length > 0);
 
-      const engine = new SyncEngine(
-        this.app.vault,
-        fs,
-        this.settings.remotePath,
-        overrideStrategy ?? this.settings.conflictStrategy,
+      const engine = new SyncEngine(this.app.vault, fs, {
+        remotePath: this.settings.remotePath,
+        conflictStrategy: overrideStrategy ?? this.settings.conflictStrategy,
         excludePatterns,
-      );
+        syncIdentityId: this.settings.syncIdentityId,
+        tombstoneJitterMs: this.settings.tombstoneJitterMs,
+        honorTombstoneOnRecreate: this.settings.honorTombstoneOnRecreate,
+        remoteAbsenceGraceCycles: this.settings.remoteAbsenceGraceCycles,
+      });
 
-      // Safety: suppress deleteOrphans on first sync to prevent wiping a
-      // populated remote when the local vault is empty (#1)
+      // Safety: suppress the deleteOrphans flag on first sync (legacy #1 guard).
+      // The new engine also uses prev-sync history + delete-log shards to make
+      // ghost resurrection structurally impossible regardless of this flag.
       const isFirstSync = this.settings.lastSync === 0;
       const deleteOrphans = isFirstSync ? false : this.settings.deleteOrphans;
       if (isFirstSync && this.settings.deleteOrphans) {
