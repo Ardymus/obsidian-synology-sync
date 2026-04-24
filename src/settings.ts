@@ -21,6 +21,27 @@ export interface SynologySyncSettings {
   lastSync: number;
   deviceId: string;
   deviceToken: string;
+
+  // Stable identity for this device's delete-log shard on the NAS.
+  // Distinct from deviceId (which is the DSM 2FA `did` cookie, overwritten on login).
+  // Generated once on first plugin load; never rewritten.
+  syncIdentityId: string;
+
+  // Delete-log retention. 0 = keep forever (default; shard is tiny).
+  tombstoneRetentionDays: number;
+
+  // When a local file exists and a tombstone marks the path deleted, the default
+  // behavior is preserve-local and purge the stale tombstone (prevents silent data loss).
+  // Setting this to true honors the tombstone and deletes the local file.
+  honorTombstoneOnRecreate: boolean;
+
+  // Grace window for clock skew across devices (milliseconds). Used by the
+  // decision-table mtime gate on rows 8 and 10 to detect recreate-after-delete.
+  tombstoneJitterMs: number;
+
+  // Rows 3/10 staleness gate: upload local file if remote has been absent
+  // for fewer than N sync cycles; beyond that, prefer delete-local.
+  remoteAbsenceGraceCycles: number;
 }
 
 export const DEFAULT_SETTINGS: SynologySyncSettings = {
@@ -40,6 +61,11 @@ export const DEFAULT_SETTINGS: SynologySyncSettings = {
   lastSync: 0,
   deviceId: "",
   deviceToken: "",
+  syncIdentityId: "",
+  tombstoneRetentionDays: 0,
+  honorTombstoneOnRecreate: false,
+  tombstoneJitterMs: 5000,
+  remoteAbsenceGraceCycles: 2,
 };
 
 export class SynologySyncSettingTab extends PluginSettingTab {
