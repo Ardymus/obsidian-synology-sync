@@ -292,7 +292,7 @@ export class SynologySyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Delete remote orphans")
-      .setDesc("Remove files from NAS that no longer exist locally (dangerous)")
+      .setDesc("Remove files from NAS that no longer exist locally. Automatically disabled on first sync to prevent data loss.")
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.deleteOrphans).onChange(async (value) => {
           this.plugin.settings.deleteOrphans = value;
