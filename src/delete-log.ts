@@ -5,11 +5,17 @@
 export interface TombstoneFileStation {
   listAllFiles(dir: string): Promise<Array<{ path: string; name?: string }>>;
   download(fullPath: string): Promise<ArrayBuffer>;
+  /**
+   * NOTE: `createParents` matches FileStation.upload's 4th parameter — the
+   * underlying File Station API always overwrites existing files, so there
+   * is no separate overwrite flag.  Pass `true` to ensure the tombstones
+   * directory is created on first use.
+   */
   upload(
     remoteDir: string,
     fileName: string,
     data: ArrayBuffer,
-    overwrite: boolean,
+    createParents: boolean,
     mtime?: number,
   ): Promise<void>;
   delete(fullPath: string): Promise<void>;

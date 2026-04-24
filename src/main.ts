@@ -5,6 +5,35 @@ import { SyncEngine, SyncResult } from "./sync";
 import { SynologySyncSettings, SynologySyncSettingTab, DEFAULT_SETTINGS } from "./settings";
 import { debugLog, getDebugLog } from "./debug";
 
+// UUID generator with fallbacks for older runtimes.
+// crypto.randomUUID requires iOS 15.4+ / Chromium 92+; we fall back through
+// crypto.getRandomValues (broad support) to a non-crypto timestamp+Math.random
+// combo (last-resort; still unique enough for a per-install shard name).
+function generateSyncIdentityId(): string {
+  const c: Crypto | undefined =
+    typeof crypto !== "undefined" ? (crypto as Crypto) : undefined;
+  if (c && typeof c.randomUUID === "function") {
+    return c.randomUUID();
+  }
+  if (c && typeof c.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    c.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // RFC 4122 version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 10xx
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    return (
+      hex.slice(0, 8) + "-" +
+      hex.slice(8, 12) + "-" +
+      hex.slice(12, 16) + "-" +
+      hex.slice(16, 20) + "-" +
+      hex.slice(20, 32)
+    );
+  }
+  const t = Date.now().toString(16);
+  const r = () => Math.random().toString(16).slice(2, 10);
+  return `${t}-${r()}-${r()}-${r()}`;
+}
+
 export default class SynologySync extends Plugin {
   settings: SynologySyncSettings = DEFAULT_SETTINGS;
   private autoSyncInterval: number | null = null;
@@ -59,7 +88,7 @@ export default class SynologySync extends Plugin {
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     if (!this.settings.syncIdentityId) {
-      this.settings.syncIdentityId = crypto.randomUUID();
+      this.settings.syncIdentityId = generateSyncIdentityId();
       await this.saveSettings();
     }
   }
@@ -122,7 +151,7 @@ export default class SynologySync extends Plugin {
   async trustDevice(otpCode: string): Promise<LoginResult> {
     // Generate a stable device ID if we don't have one
     if (!this.settings.deviceId) {
-      this.settings.deviceId = crypto.randomUUID();
+      this.settings.deviceId = generateSyncIdentityId();
     }
 
     const config = await this.buildConfig(otpCode);

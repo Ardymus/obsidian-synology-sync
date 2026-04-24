@@ -13,8 +13,8 @@ describe("DEFAULT_SETTINGS", () => {
     expect(DEFAULT_SETTINGS.honorTombstoneOnRecreate).toBe(false);
   });
 
-  it("has a 5s jitter default for the mtime gate", () => {
-    expect(DEFAULT_SETTINGS.tombstoneJitterMs).toBe(5000);
+  it("has a 30s jitter default for the mtime gate (absorbs cross-device clock skew)", () => {
+    expect(DEFAULT_SETTINGS.tombstoneJitterMs).toBe(30000);
   });
 
   it("has remoteAbsenceGraceCycles=2 by default", () => {

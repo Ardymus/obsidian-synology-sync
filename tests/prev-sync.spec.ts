@@ -215,31 +215,131 @@ describe("writePrevSync", () => {
 // ---------------------------------------------------------------------------
 
 describe("buildPrevSyncSnapshot", () => {
-  it("stamps every entry with the provided syncCompletedAt as lastSyncTs", () => {
-    const localFiles = new Map([
+  const emptyHistory: PrevSyncMap = new Map();
+  const emptyErrored = new Set<string>();
+
+  it("stamps every entry with `now` as lastSyncTs and resets missingCount when remote present", () => {
+    const freshLocal = new Map([
       ["docs/one.md", { mtime: 111, size: 222 }],
       ["docs/two.md", { mtime: 333, size: 444 }],
     ]);
-    const syncTs = 9999999;
+    const preSyncRemote = new Set(["docs/one.md", "docs/two.md"]);
 
-    const result = buildPrevSyncSnapshot(localFiles, syncTs);
+    const result = buildPrevSyncSnapshot({
+      freshLocal,
+      preSyncRemote,
+      priorHistory: emptyHistory,
+      erroredPaths: emptyErrored,
+      now: 9999999,
+    });
 
     expect(result.size).toBe(2);
-
     const e1 = result.get("docs/one.md") as PrevSyncEntry;
-    expect(e1.mtime).toBe(111);
-    expect(e1.size).toBe(222);
-    expect(e1.lastSyncTs).toBe(syncTs);
-
+    expect(e1).toEqual({ mtime: 111, size: 222, lastSyncTs: 9999999, missingCount: 0 });
     const e2 = result.get("docs/two.md") as PrevSyncEntry;
-    expect(e2.mtime).toBe(333);
-    expect(e2.size).toBe(444);
-    expect(e2.lastSyncTs).toBe(syncTs);
+    expect(e2).toEqual({ mtime: 333, size: 444, lastSyncTs: 9999999, missingCount: 0 });
   });
 
-  it("returns empty Map for empty input", () => {
-    const result = buildPrevSyncSnapshot(new Map(), 12345);
+  it("returns empty Map when freshLocal is empty and no errored paths", () => {
+    const result = buildPrevSyncSnapshot({
+      freshLocal: new Map(),
+      preSyncRemote: new Set(),
+      priorHistory: emptyHistory,
+      erroredPaths: emptyErrored,
+      now: 12345,
+    });
     expect(result.size).toBe(0);
+  });
+
+  it("increments missingCount for local paths that were absent remotely at sync start", () => {
+    const freshLocal = new Map([["notes/a.md", { mtime: 100, size: 10 }]]);
+    const priorHistory: PrevSyncMap = new Map([
+      ["notes/a.md", { mtime: 50, size: 5, lastSyncTs: 10, missingCount: 2 }],
+    ]);
+
+    const result = buildPrevSyncSnapshot({
+      freshLocal,
+      preSyncRemote: new Set(), // remote absent
+      priorHistory,
+      erroredPaths: emptyErrored,
+      now: 1000,
+    });
+
+    const entry = result.get("notes/a.md") as PrevSyncEntry;
+    expect(entry.missingCount).toBe(3); // prior 2 + 1
+    expect(entry.lastSyncTs).toBe(1000);
+  });
+
+  it("resets missingCount to 0 when remote appears again", () => {
+    const freshLocal = new Map([["notes/b.md", { mtime: 100, size: 10 }]]);
+    const priorHistory: PrevSyncMap = new Map([
+      ["notes/b.md", { mtime: 50, size: 5, lastSyncTs: 10, missingCount: 5 }],
+    ]);
+
+    const result = buildPrevSyncSnapshot({
+      freshLocal,
+      preSyncRemote: new Set(["notes/b.md"]), // remote present
+      priorHistory,
+      erroredPaths: emptyErrored,
+      now: 1000,
+    });
+
+    const entry = result.get("notes/b.md") as PrevSyncEntry;
+    expect(entry.missingCount).toBe(0);
+  });
+
+  it("preserves prior history entry for errored paths not in freshLocal (Opus SS #1 fix)", () => {
+    // Row 7 scenario: user deleted locally, fs.delete threw.
+    // freshLocal no longer has the path, but history did.  Preserve it so
+    // the next sync fires Row 7 again instead of Row 9 (resurrect).
+    const freshLocal = new Map();
+    const priorHistory: PrevSyncMap = new Map([
+      ["ghost.md", { mtime: 1, size: 1, lastSyncTs: 100 }],
+    ]);
+    const erroredPaths = new Set(["ghost.md"]);
+
+    const result = buildPrevSyncSnapshot({
+      freshLocal,
+      preSyncRemote: new Set(["ghost.md"]),
+      priorHistory,
+      erroredPaths,
+      now: 500,
+    });
+
+    const entry = result.get("ghost.md") as PrevSyncEntry;
+    expect(entry).toEqual({ mtime: 1, size: 1, lastSyncTs: 100 });
+  });
+
+  it("does nothing for errored paths that have no prior history", () => {
+    const result = buildPrevSyncSnapshot({
+      freshLocal: new Map(),
+      preSyncRemote: new Set(),
+      priorHistory: new Map(),
+      erroredPaths: new Set(["mystery.md"]),
+      now: 500,
+    });
+    expect(result.has("mystery.md")).toBe(false);
+  });
+
+  it("prefers fresh data over prior entry when path is in both freshLocal and erroredPaths", () => {
+    const freshLocal = new Map([["conflict.md", { mtime: 999, size: 999 }]]);
+    const priorHistory: PrevSyncMap = new Map([
+      ["conflict.md", { mtime: 1, size: 1, lastSyncTs: 1 }],
+    ]);
+    const erroredPaths = new Set(["conflict.md"]);
+
+    const result = buildPrevSyncSnapshot({
+      freshLocal,
+      preSyncRemote: new Set(["conflict.md"]),
+      priorHistory,
+      erroredPaths,
+      now: 500,
+    });
+
+    const entry = result.get("conflict.md") as PrevSyncEntry;
+    expect(entry.mtime).toBe(999);
+    expect(entry.size).toBe(999);
+    expect(entry.lastSyncTs).toBe(500);
   });
 });
 

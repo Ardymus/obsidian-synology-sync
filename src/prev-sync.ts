@@ -28,6 +28,11 @@ export interface PrevSyncEntry {
   mtime: number;
   size: number;
   lastSyncTs: number;
+  /**
+   * Consecutive cycles this path has been present locally but absent remotely.
+   * Consumed by the Row 3 staleness gate.  Omitted for backward-compat reads.
+   */
+  missingCount?: number;
 }
 
 export type PrevSyncMap = Map<string, PrevSyncEntry>;
@@ -49,6 +54,7 @@ interface PrevSyncFileEntry {
   mtime: number;
   size: number;
   last_sync_ts: number;
+  missing_count?: number;
 }
 
 interface PrevSyncFile {
@@ -123,11 +129,15 @@ export async function readPrevSync(
       typeof entry.size === "number" &&
       typeof entry.last_sync_ts === "number"
     ) {
-      result.set(path, {
+      const mapped: PrevSyncEntry = {
         mtime: entry.mtime,
         size: entry.size,
         lastSyncTs: entry.last_sync_ts,
-      });
+      };
+      if (typeof entry.missing_count === "number") {
+        mapped.missingCount = entry.missing_count;
+      }
+      result.set(path, mapped);
     }
   }
 
@@ -153,11 +163,15 @@ export async function writePrevSync(
   const filesRecord: Record<string, PrevSyncFileEntry> = {};
 
   for (const [path, entry] of entries) {
-    filesRecord[path] = {
+    const out: PrevSyncFileEntry = {
       mtime: entry.mtime,
       size: entry.size,
       last_sync_ts: entry.lastSyncTs,
     };
+    if (typeof entry.missingCount === "number" && entry.missingCount > 0) {
+      out.missing_count = entry.missingCount;
+    }
+    filesRecord[path] = out;
   }
 
   const payload: PrevSyncFile = {
@@ -184,23 +198,55 @@ export async function writePrevSync(
 // buildPrevSyncSnapshot
 // ---------------------------------------------------------------------------
 
-/**
- * Converts a scan of local files into a PrevSyncMap stamped with
- * `syncCompletedAt` as the `lastSyncTs` for every entry.
- */
-export function buildPrevSyncSnapshot(
-  localFiles: Map<string, { mtime: number; size: number }>,
-  syncCompletedAt: number,
-): PrevSyncMap {
-  const result: PrevSyncMap = new Map();
+export interface SnapshotInputs {
+  /** Local scan taken AFTER sync actions have been applied. */
+  freshLocal: Map<string, { mtime: number; size: number }>;
+  /** Paths present remotely at sync start (pre-sync scan). */
+  preSyncRemote: Set<string>;
+  /** Prior history as loaded at sync start. */
+  priorHistory: PrevSyncMap;
+  /** Paths whose sync action errored and must NOT lose their history entry. */
+  erroredPaths: Set<string>;
+  /** Timestamp to stamp on entries (Date.now() at snapshot time). */
+  now: number;
+}
 
-  for (const [path, stat] of localFiles) {
-    result.set(path, {
+/**
+ * Builds the next prev-sync snapshot.
+ *
+ * For each locally-present path, records fresh stats and updates `missingCount`:
+ *   - reset to 0 if the path was present remotely at sync start
+ *   - otherwise incremented from the prior value (Row 3 staleness gate input)
+ *
+ * For each errored path that is NOT in the fresh local scan but WAS in prior
+ * history, the prior entry is carried forward unchanged.  This preserves
+ * enough state for the next sync to re-fire the same decision-table row
+ * (e.g. retry a failed delete-remote on Row 7) rather than misreading the
+ * path as "never-seen" → Row 9 → resurrection.
+ */
+export function buildPrevSyncSnapshot(inputs: SnapshotInputs): PrevSyncMap {
+  const { freshLocal, preSyncRemote, priorHistory, erroredPaths, now } = inputs;
+  const snapshot: PrevSyncMap = new Map();
+
+  for (const [path, stat] of freshLocal) {
+    const prior = priorHistory.get(path);
+    const wasRemoteAtStart = preSyncRemote.has(path);
+    const priorMissing = prior?.missingCount ?? 0;
+    const missingCount = wasRemoteAtStart ? 0 : priorMissing + 1;
+    snapshot.set(path, {
       mtime: stat.mtime,
       size: stat.size,
-      lastSyncTs: syncCompletedAt,
+      lastSyncTs: now,
+      missingCount,
     });
   }
 
-  return result;
+  for (const p of erroredPaths) {
+    if (!snapshot.has(p)) {
+      const prior = priorHistory.get(p);
+      if (prior) snapshot.set(p, { ...prior });
+    }
+  }
+
+  return snapshot;
 }

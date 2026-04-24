@@ -18,7 +18,16 @@ export type Action =
 
 export interface LocalEntry   { mtime: number; size: number }
 export interface RemoteEntry  { mtime: number; size: number }
-export interface HistoryEntry { mtime: number; size: number; lastSyncTs: number }
+export interface HistoryEntry {
+  mtime: number;
+  size: number;
+  lastSyncTs: number;
+  /**
+   * Consecutive syncs this path has been present in history but absent remotely.
+   * Used by the Row 3 staleness gate.
+   */
+  missingCount?: number;
+}
 export interface TombstoneEntry { deleted_at: number }
 
 export interface DecideConfig {
@@ -31,15 +40,15 @@ export interface DecideConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: mtime gate — returns true when the remote file is newer than the
-// delete event (with jitter tolerance), meaning the file was re-created.
+// Helper: mtime gate — returns true when `mtime` is newer than the delete
+// event (with jitter tolerance), meaning the file was re-created.
 // ---------------------------------------------------------------------------
-function remoteIsNewerThanTombstone(
-  remote: RemoteEntry,
+function mtimeBeatsTombstone(
+  mtime: number,
   tombstone: TombstoneEntry,
   jitterMs: number,
 ): boolean {
-  return remote.mtime > tombstone.deleted_at + jitterMs;
+  return mtime > tombstone.deleted_at + jitterMs;
 }
 
 // ---------------------------------------------------------------------------
@@ -87,8 +96,15 @@ export function decideAction(
     return { kind: "delete-local" };
   }
 
-  // Row 4: L — H T → delete-local (tombstone confirms another device deleted)
+  // Row 4: L — H T → local-mtime gate.
+  // If the local file has been modified AFTER the tombstone (beyond jitter),
+  // the user edited it post-peer-delete; treat as a live file rather than
+  // silently deleting their changes. Fall through to conflict-resolve with
+  // the tombstone purged. Otherwise, honor the tombstone and delete-local.
   if (L && !R && H && T) {
+    if (mtimeBeatsTombstone((local as LocalEntry).mtime, tombstone as TombstoneEntry, cfg.tombstoneJitterMs)) {
+      return { kind: "keep-local-purge-tombstone" };
+    }
     return { kind: "delete-local" };
   }
 
@@ -112,7 +128,7 @@ export function decideAction(
 
   // Row 8: — R H T → mtime gate
   if (!L && R && H && T) {
-    if (remoteIsNewerThanTombstone(remote as RemoteEntry, tombstone as TombstoneEntry, cfg.tombstoneJitterMs)) {
+    if (mtimeBeatsTombstone((remote as RemoteEntry).mtime, tombstone as TombstoneEntry, cfg.tombstoneJitterMs)) {
       return { kind: "recreate-after-delete", purgeTombstone: true };
     }
     return { kind: "delete-remote-stale-tombstone" };
@@ -125,7 +141,7 @@ export function decideAction(
 
   // Row 10: — R — T → mtime gate (multi-device ghost-resurrection fix)
   if (!L && R && !H && T) {
-    if (remoteIsNewerThanTombstone(remote as RemoteEntry, tombstone as TombstoneEntry, cfg.tombstoneJitterMs)) {
+    if (mtimeBeatsTombstone((remote as RemoteEntry).mtime, tombstone as TombstoneEntry, cfg.tombstoneJitterMs)) {
       return { kind: "recreate-after-delete", purgeTombstone: true };
     }
     return { kind: "delete-remote-stale-tombstone" };

@@ -61,11 +61,32 @@ describe("Row 3: L — H —", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Row 4: L — H T → delete-local (tombstone confirms deletion)
+// Row 4: L — H T → local-mtime gate.
+//   If local.mtime > tombstone.deleted_at + jitter → keep-local-purge-tombstone
+//   (user edited file after peer's delete; preserve their changes).
+//   Otherwise → delete-local (tombstone confirms deletion).
 // ---------------------------------------------------------------------------
 describe("Row 4: L — H T", () => {
-  it("returns delete-local", () => {
+  it("returns delete-local when local was unchanged since before the tombstone", () => {
+    // L.mtime=1000, T.deleted_at=1500, jitter=5000 → 1000 > 6500? No.
     const result = decideAction(L, undefined, H, T, baseCfg);
+    expect(result).toEqual<Action>({ kind: "delete-local" });
+  });
+
+  it("returns keep-local-purge-tombstone when local.mtime > deleted_at + jitter (post-delete edit)", () => {
+    // User edited the file AFTER a peer's delete propagated; preserve their work.
+    const localEdited = { mtime: 10000, size: 100 };
+    const tombstone = { deleted_at: 0 };
+    const cfg = { ...baseCfg, tombstoneJitterMs: 5000 };
+    const result = decideAction(localEdited, undefined, H, tombstone, cfg);
+    expect(result).toEqual<Action>({ kind: "keep-local-purge-tombstone" });
+  });
+
+  it("returns delete-local on boundary (local.mtime === deleted_at + jitter, strict >)", () => {
+    const localBoundary = { mtime: 5000, size: 100 };
+    const tombstone = { deleted_at: 0 };
+    const cfg = { ...baseCfg, tombstoneJitterMs: 5000 };
+    const result = decideAction(localBoundary, undefined, H, tombstone, cfg);
     expect(result).toEqual<Action>({ kind: "delete-local" });
   });
 });

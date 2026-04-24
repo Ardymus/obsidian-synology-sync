@@ -64,7 +64,10 @@ export const DEFAULT_SETTINGS: SynologySyncSettings = {
   syncIdentityId: "",
   tombstoneRetentionDays: 0,
   honorTombstoneOnRecreate: false,
-  tombstoneJitterMs: 5000,
+  // 30s jitter absorbs typical cross-device clock skew.  Tightening this
+  // reduces the window in which a legitimate recreate-after-delete could be
+  // mis-detected as a stale tombstone and silently deleted.
+  tombstoneJitterMs: 30000,
   remoteAbsenceGraceCycles: 2,
 };
 

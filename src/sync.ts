@@ -157,6 +157,12 @@ export class SyncEngine {
     const pendingShardWrites = new Map<string, ShardTombstoneEntry>();
     const pendingShardPurges = new Set<string>();
 
+    // Paths whose outcome did NOT cleanly persist.  Their prior history
+    // entries are preserved in the snapshot so the next sync fires the same
+    // row again (e.g. Row 7 retry) instead of mis-diagnosing the path as
+    // "never-seen-before" → Row 9 → resurrection.
+    const erroredPaths = new Set<string>();
+
     const allPaths = new Set<string>([
       ...local.keys(),
       ...remote.keys(),
@@ -177,9 +183,7 @@ export class SyncEngine {
         tombstoneJitterMs: this.tombstoneJitterMs,
         honorTombstoneOnRecreate: this.honorTombstoneOnRecreate,
         remoteAbsenceGraceCycles: this.remoteAbsenceGraceCycles,
-        // v1: remote-absence tracking not yet persisted; treat every absence
-        // as "within grace" → upload on row 3. Safe default (preserves local).
-        remoteAbsenceCount: 0,
+        remoteAbsenceCount: h?.missingCount ?? 0,
       };
 
       const action = decideAction(
@@ -203,11 +207,15 @@ export class SyncEngine {
       } catch (e) {
         const errMsg = (e as Error).message;
         result.errors.push({ path, error: errMsg });
+        erroredPaths.add(path);
         debugLog(`SYNC ERROR: ${path} - ${errMsg} (action=${action.kind})`);
       }
     }
 
-    // Persist own shard iff anything changed
+    // Persist own shard iff anything changed.  If the upload itself fails,
+    // every path with pending writes/purges must be treated as errored so
+    // its history entry is preserved for next-cycle retry.
+    let shardWriteFailed = false;
     if (pendingShardWrites.size > 0 || pendingShardPurges.size > 0) {
       try {
         await updateOwnShard(
@@ -218,15 +226,32 @@ export class SyncEngine {
           pendingShardPurges,
         );
       } catch (e) {
+        shardWriteFailed = true;
         result.errors.push({ path: "<shard>", error: (e as Error).message });
         debugLog(`SYNC ERROR shard-write: ${(e as Error).message}`);
+        for (const p of pendingShardWrites.keys()) erroredPaths.add(p);
+        for (const p of pendingShardPurges) erroredPaths.add(p);
       }
     }
+    void shardWriteFailed;
 
     // Persist prev-sync history snapshot (post-sync view of local).
+    //   - For paths present in freshLocal: record fresh stats.  If the path
+    //     was absent remotely at sync-start, carry / increment missingCount
+    //     (Row 3 staleness gate); otherwise reset to 0.
+    //   - For errored paths that were in prior history but are no longer
+    //     in freshLocal: preserve the prior entry unchanged.  This is the
+    //     core fix for Opus showstoppers #1 and #2.
     try {
       const freshLocal = await this.getLocalFiles();
-      const snapshot = buildPrevSyncSnapshot(freshLocal, Date.now());
+      const preSyncRemote = new Set(remote.keys());
+      const snapshot = buildPrevSyncSnapshot({
+        freshLocal,
+        preSyncRemote,
+        priorHistory: history,
+        erroredPaths,
+        now: Date.now(),
+      });
       await writePrevSync(this.adapter, snapshot);
     } catch (e) {
       result.errors.push({ path: "<prev-sync>", error: (e as Error).message });
