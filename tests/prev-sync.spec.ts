@@ -48,17 +48,6 @@ function makeFakeAdapter(initial?: Record<string, string>): {
       calls.push({ method: "write", args: [p, data] });
       store.set(p, data);
     },
-    async rename(from: string, to: string): Promise<void> {
-      calls.push({ method: "rename", args: [from, to] });
-      const val = store.get(from);
-      if (val === undefined) throw new Error(`rename source not found: ${from}`);
-      store.set(to, val);
-      store.delete(from);
-    },
-    async remove(p: string): Promise<void> {
-      calls.push({ method: "remove", args: [p] });
-      store.delete(p);
-    },
   };
 
   return { adapter, store, calls };
@@ -141,7 +130,7 @@ describe("readPrevSync", () => {
 // ---------------------------------------------------------------------------
 
 describe("writePrevSync", () => {
-  it("writes to .tmp first, then renames tmp → final", async () => {
+  it("writes directly to the final path in a single call", async () => {
     const { adapter, calls } = makeFakeAdapter();
     const entries: PrevSyncMap = new Map([
       ["notes/a.md", { mtime: 1000, size: 512, lastSyncTs: 2000 }],
@@ -150,21 +139,13 @@ describe("writePrevSync", () => {
     await writePrevSync(adapter, entries);
 
     const writeCalls = calls.filter((c) => c.method === "write");
-    const renameCalls = calls.filter((c) => c.method === "rename");
 
-    // Only one write call, targeting .tmp
+    // Exactly one write, straight to PREV_SYNC_PATH — no tmp-then-rename.
+    // Obsidian's DataAdapter.write is already atomic; wrapping it with
+    // rename() was both redundant and broken because DataAdapter.rename
+    // rejects existing destinations (issue #5).
     expect(writeCalls).toHaveLength(1);
-    expect(writeCalls[0].args[0]).toBe(PREV_SYNC_PATH + ".tmp");
-
-    // One rename from .tmp to final
-    expect(renameCalls).toHaveLength(1);
-    expect(renameCalls[0].args[0]).toBe(PREV_SYNC_PATH + ".tmp");
-    expect(renameCalls[0].args[1]).toBe(PREV_SYNC_PATH);
-
-    // write must come before rename
-    const writeIdx = calls.indexOf(writeCalls[0]);
-    const renameIdx = calls.indexOf(renameCalls[0]);
-    expect(writeIdx).toBeLessThan(renameIdx);
+    expect(writeCalls[0].args[0]).toBe(PREV_SYNC_PATH);
   });
 
   it("writes a valid empty-files doc when entries map is empty", async () => {
@@ -173,7 +154,7 @@ describe("writePrevSync", () => {
 
     await writePrevSync(adapter, entries);
 
-    // After atomic rename, final path exists and tmp is gone
+    // Final path exists and no stray .tmp is left behind
     expect(store.has(PREV_SYNC_PATH)).toBe(true);
     expect(store.has(PREV_SYNC_PATH + ".tmp")).toBe(false);
 
@@ -182,31 +163,21 @@ describe("writePrevSync", () => {
     expect(doc.files).toEqual({});
   });
 
-  it("removes .tmp file if rename throws, then re-throws original error", async () => {
-    const { adapter, calls } = makeFakeAdapter();
+  it("propagates errors from adapter.write to the caller", async () => {
+    const { adapter } = makeFakeAdapter();
 
-    // Override rename to throw
-    const originalRename = adapter.rename.bind(adapter);
-    const renameError = new Error("rename failed");
-    adapter.rename = async (from: string, to: string): Promise<void> => {
-      calls.push({ method: "rename", args: [from, to] });
-      throw renameError;
+    // Override write to throw; the error must bubble up so sync.ts can
+    // log it and preserve history for next-cycle retry.
+    const writeError = new Error("disk full");
+    adapter.write = async (): Promise<void> => {
+      throw writeError;
     };
 
     const entries: PrevSyncMap = new Map([
       ["note.md", { mtime: 1, size: 1, lastSyncTs: 1 }],
     ]);
 
-    // The error must propagate
-    await expect(writePrevSync(adapter, entries)).rejects.toThrow("rename failed");
-
-    // A remove call for the .tmp path must have happened
-    const removeCalls = calls.filter((c) => c.method === "remove");
-    expect(removeCalls).toHaveLength(1);
-    expect(removeCalls[0].args[0]).toBe(PREV_SYNC_PATH + ".tmp");
-
-    // Suppress unused-variable warning — originalRename kept for intent clarity
-    void originalRename;
+    await expect(writePrevSync(adapter, entries)).rejects.toThrow("disk full");
   });
 });
 
