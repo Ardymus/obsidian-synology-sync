@@ -16,8 +16,6 @@ export interface PrevSyncAdapter {
   exists(p: string): Promise<boolean>;
   read(p: string): Promise<string>;
   write(p: string, data: string): Promise<void>;
-  rename(from: string, to: string): Promise<void>;
-  remove(p: string): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -43,8 +41,6 @@ export type PrevSyncMap = Map<string, PrevSyncEntry>;
 
 export const PREV_SYNC_PATH =
   ".obsidian/plugins/synology-sync/prev-sync.json";
-
-const PREV_SYNC_TMP = PREV_SYNC_PATH + ".tmp";
 
 // ---------------------------------------------------------------------------
 // On-disk JSON schema (v1)
@@ -149,12 +145,12 @@ export async function readPrevSync(
 // ---------------------------------------------------------------------------
 
 /**
- * Atomically persists `entries` to disk.
+ * Persists `entries` to disk via `adapter.write`.
  *
- * Write sequence:
- *   1. Write JSON to `PREV_SYNC_PATH + ".tmp"`
- *   2. Rename tmp → PREV_SYNC_PATH
- *   3. If rename throws, best-effort remove the tmp file, then re-throw.
+ * Obsidian's DataAdapter.write is itself atomic (internal tmp+rename on mobile,
+ * direct overwrite on desktop). An outer tmp-then-rename is both redundant and
+ * broken across platforms because DataAdapter.rename rejects existing targets
+ * with "Destination file already exists!" — see issue #5.
  */
 export async function writePrevSync(
   adapter: PrevSyncAdapter,
@@ -179,19 +175,7 @@ export async function writePrevSync(
     files: filesRecord,
   };
 
-  await adapter.write(PREV_SYNC_TMP, JSON.stringify(payload, null, 2));
-
-  try {
-    await adapter.rename(PREV_SYNC_TMP, PREV_SYNC_PATH);
-  } catch (renameErr) {
-    // Best-effort cleanup — swallow remove errors so we re-throw the original.
-    try {
-      await adapter.remove(PREV_SYNC_TMP);
-    } catch {
-      // intentionally ignored
-    }
-    throw renameErr;
-  }
+  await adapter.write(PREV_SYNC_PATH, JSON.stringify(payload, null, 2));
 }
 
 // ---------------------------------------------------------------------------
