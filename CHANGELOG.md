@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 2026.430.3
+
 ### fix: Use QuickConnect relay auth for off-network access — closes #21
 
 Uses the regional QuickConnect relay portal intentionally when direct candidates fail and switches relay login to a portal-compatible POST auth flow.
