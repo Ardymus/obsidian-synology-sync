@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 2026.04.30.1
+
 ### fix: QuickConnect regional portal fallback — closes #8
 
 Adds the regional QuickConnect portal host returned by Synology relay metadata to the resolver candidate list, deduplicates candidates, and enforces the intended per-candidate ping timeout.
@@ -9,6 +11,10 @@ Adds the regional QuickConnect portal host returned by Synology relay metadata t
 ### docs: Add contributing requirements — closes #10
 
 Adds contributor rules matching the issue-first, architecture-impact, changelog, and CI gates used by `ForkTheGhost/Skills`.
+
+### chore: Release 2026.04.30.1 — closes #12
+
+Updates plugin release metadata and publishes the April 30, 2026 release.
 
 ## 2026.04.24.2
 
