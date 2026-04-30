@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 2026.430.2
+
 ### fix: Stop QuickConnect unreachable fallback — closes #19
 
 Stops the resolver from attempting auth against candidates that already failed ping-pong and reports a clear no-reachable-endpoint error instead.
