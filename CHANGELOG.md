@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 2026.430.5
+
 ### fix: Bound QuickConnect server-info lookup — closes #25
 
 Adds explicit logging and a timeout around the initial QuickConnect `Serv.php` lookup so resolution cannot hang after only logging the QuickConnect ID.
