@@ -64,12 +64,31 @@ export const DEFAULT_SETTINGS: SynologySyncSettings = {
   syncIdentityId: "",
   tombstoneRetentionDays: 0,
   honorTombstoneOnRecreate: false,
-  // 30s jitter absorbs typical cross-device clock skew.  Tightening this
-  // reduces the window in which a legitimate recreate-after-delete could be
-  // mis-detected as a stale tombstone and silently deleted.
-  tombstoneJitterMs: 30000,
+  // 5s jitter absorbs realistic cross-device clock skew (Synology mtime
+  // resolution is 1 second). The prior default of 30s was too wide — it
+  // created a 30-second window where a live remote file could be treated
+  // as a stale tombstone and silently deleted.
+  tombstoneJitterMs: 5000,
   remoteAbsenceGraceCycles: 2,
 };
+
+// Legacy default that was shipped in releases prior to 2026.0505.1.
+// Used by the migration shim to distinguish "user left the old default"
+// from "user intentionally set a custom value".
+const LEGACY_TOMBSTONE_JITTER_MS = 30000;
+
+/**
+ * Applies one-time migrations to settings loaded from disk.
+ * Returns true if any value was changed (caller should persist).
+ */
+export function migrateLoadedSettings(settings: SynologySyncSettings): boolean {
+  let changed = false;
+  if (settings.tombstoneJitterMs === LEGACY_TOMBSTONE_JITTER_MS) {
+    settings.tombstoneJitterMs = DEFAULT_SETTINGS.tombstoneJitterMs;
+    changed = true;
+  }
+  return changed;
+}
 
 export class SynologySyncSettingTab extends PluginSettingTab {
   plugin: SynologySync;

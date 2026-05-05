@@ -1,4 +1,8 @@
-import { DEFAULT_SETTINGS, SynologySyncSettings } from "../src/settings";
+import {
+  DEFAULT_SETTINGS,
+  SynologySyncSettings,
+  migrateLoadedSettings,
+} from "../src/settings";
 
 describe("DEFAULT_SETTINGS", () => {
   it("has syncIdentityId empty by default (bootstrapped on first load)", () => {
@@ -13,8 +17,8 @@ describe("DEFAULT_SETTINGS", () => {
     expect(DEFAULT_SETTINGS.honorTombstoneOnRecreate).toBe(false);
   });
 
-  it("has a 30s jitter default for the mtime gate (absorbs cross-device clock skew)", () => {
-    expect(DEFAULT_SETTINGS.tombstoneJitterMs).toBe(30000);
+  it("has a 5s jitter default for the mtime gate (matches Synology 1s mtime resolution + small clock skew)", () => {
+    expect(DEFAULT_SETTINGS.tombstoneJitterMs).toBe(5000);
   });
 
   it("has remoteAbsenceGraceCycles=2 by default", () => {
@@ -32,5 +36,28 @@ describe("DEFAULT_SETTINGS", () => {
     expect("syncIdentityId" in s).toBe(true);
     expect(s.deviceId).toBe("");
     expect(s.syncIdentityId).toBe("");
+  });
+});
+
+describe("migrateLoadedSettings", () => {
+  it("rewrites legacy 30000ms jitter to the new 5000ms default", () => {
+    const s: SynologySyncSettings = { ...DEFAULT_SETTINGS, tombstoneJitterMs: 30000 };
+    const changed = migrateLoadedSettings(s);
+    expect(changed).toBe(true);
+    expect(s.tombstoneJitterMs).toBe(5000);
+  });
+
+  it("leaves a custom jitter value untouched", () => {
+    const s: SynologySyncSettings = { ...DEFAULT_SETTINGS, tombstoneJitterMs: 15000 };
+    const changed = migrateLoadedSettings(s);
+    expect(changed).toBe(false);
+    expect(s.tombstoneJitterMs).toBe(15000);
+  });
+
+  it("leaves the new default untouched", () => {
+    const s: SynologySyncSettings = { ...DEFAULT_SETTINGS, tombstoneJitterMs: 5000 };
+    const changed = migrateLoadedSettings(s);
+    expect(changed).toBe(false);
+    expect(s.tombstoneJitterMs).toBe(5000);
   });
 });

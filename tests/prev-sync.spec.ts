@@ -315,6 +315,145 @@ describe("buildPrevSyncSnapshot", () => {
 });
 
 // ---------------------------------------------------------------------------
+// syncStartTs / syncedLocalStats — mid-sync write protection
+// ---------------------------------------------------------------------------
+
+describe("buildPrevSyncSnapshot: syncStartTs gate", () => {
+  const emptyErrored = new Set<string>();
+
+  it("preserves prior history when local mtime > syncStartTs and no synced stat matches", () => {
+    // User saved the file at mtime=2000 while sync was in progress (started at 1500).
+    // The file was NOT written by sync itself (no entry in syncedLocalStats).
+    // Recording it as cleanly synced would mask the user's edit on next cycle,
+    // so we carry the prior history forward instead.
+    const freshLocal = new Map([
+      ["edited-during-sync.md", { mtime: 2000, size: 222 }],
+    ]);
+    const priorHistory: PrevSyncMap = new Map([
+      ["edited-during-sync.md", { mtime: 1000, size: 100, lastSyncTs: 500 }],
+    ]);
+
+    const result = buildPrevSyncSnapshot({
+      freshLocal,
+      preSyncRemote: new Set(["edited-during-sync.md"]),
+      priorHistory,
+      erroredPaths: emptyErrored,
+      now: 3000,
+      syncStartTs: 1500,
+      syncedLocalStats: new Map(),
+    });
+
+    const entry = result.get("edited-during-sync.md") as PrevSyncEntry;
+    // Carried forward, not refreshed
+    expect(entry.mtime).toBe(1000);
+    expect(entry.size).toBe(100);
+    expect(entry.lastSyncTs).toBe(500);
+  });
+
+  it("records cleanly when local mtime > syncStartTs but synced stat matches (sync wrote it)", () => {
+    // The sync downloaded the file; the post-write mtime exceeds syncStartTs
+    // because the underlying write is itself "during the sync window", but
+    // syncedLocalStats records that this exact stat came from us.
+    const freshLocal = new Map([
+      ["written-by-sync.md", { mtime: 2500, size: 200 }],
+    ]);
+    const syncedLocalStats = new Map([
+      ["written-by-sync.md", { mtime: 2500, size: 200 }],
+    ]);
+
+    const result = buildPrevSyncSnapshot({
+      freshLocal,
+      preSyncRemote: new Set(["written-by-sync.md"]),
+      priorHistory: new Map(),
+      erroredPaths: emptyErrored,
+      now: 3000,
+      syncStartTs: 1500,
+      syncedLocalStats,
+    });
+
+    const entry = result.get("written-by-sync.md") as PrevSyncEntry;
+    expect(entry).toEqual({
+      mtime: 2500,
+      size: 200,
+      lastSyncTs: 3000,
+      missingCount: 0,
+    });
+  });
+
+  it("records normally when local mtime <= syncStartTs (file untouched during sync)", () => {
+    const freshLocal = new Map([
+      ["stable.md", { mtime: 1000, size: 100 }],
+    ]);
+
+    const result = buildPrevSyncSnapshot({
+      freshLocal,
+      preSyncRemote: new Set(["stable.md"]),
+      priorHistory: new Map(),
+      erroredPaths: emptyErrored,
+      now: 3000,
+      syncStartTs: 1500,
+      syncedLocalStats: new Map(),
+    });
+
+    const entry = result.get("stable.md") as PrevSyncEntry;
+    expect(entry).toEqual({
+      mtime: 1000,
+      size: 100,
+      lastSyncTs: 3000,
+      missingCount: 0,
+    });
+  });
+
+  it("treats stat-mismatch in syncedLocalStats as a user write (size differs)", () => {
+    // Sync wrote {mtime:2500,size:200}, then user re-saved at mtime 2600 with
+    // a different size. Same path appears in syncedLocalStats but the stat
+    // does not match → must NOT be recorded as cleanly synced.
+    const freshLocal = new Map([
+      ["resaved.md", { mtime: 2600, size: 250 }],
+    ]);
+    const priorHistory: PrevSyncMap = new Map([
+      ["resaved.md", { mtime: 1000, size: 100, lastSyncTs: 500 }],
+    ]);
+    const syncedLocalStats = new Map([
+      ["resaved.md", { mtime: 2500, size: 200 }],
+    ]);
+
+    const result = buildPrevSyncSnapshot({
+      freshLocal,
+      preSyncRemote: new Set(["resaved.md"]),
+      priorHistory,
+      erroredPaths: emptyErrored,
+      now: 3000,
+      syncStartTs: 1500,
+      syncedLocalStats,
+    });
+
+    const entry = result.get("resaved.md") as PrevSyncEntry;
+    expect(entry.mtime).toBe(1000); // carried forward
+    expect(entry.size).toBe(100);
+  });
+
+  it("when syncStartTs is undefined, falls back to recording all fresh stats (back-compat)", () => {
+    const freshLocal = new Map([
+      ["future.md", { mtime: 9999, size: 100 }],
+    ]);
+
+    const result = buildPrevSyncSnapshot({
+      freshLocal,
+      preSyncRemote: new Set(["future.md"]),
+      priorHistory: new Map(),
+      erroredPaths: emptyErrored,
+      now: 5000,
+      // no syncStartTs / syncedLocalStats supplied
+    });
+
+    const entry = result.get("future.md") as PrevSyncEntry;
+    expect(entry.mtime).toBe(9999);
+    expect(entry.lastSyncTs).toBe(5000);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Round-trip
 // ---------------------------------------------------------------------------
 

@@ -276,19 +276,40 @@ export class FileStation {
 
   async listAllFiles(basePath: string): Promise<FileInfo[]> {
     const all: FileInfo[] = [];
-    const queue: string[] = [basePath];
+    let frontier: string[] = [basePath];
+    const BATCH = 5;
 
-    while (queue.length > 0) {
-      const folder = queue.shift()!;
-      const files = await this.listFolder(folder);
-      for (const f of files) {
-        if (f.isdir) {
-          queue.push(f.path);
-        } else {
-          all.push(f);
+    while (frontier.length > 0) {
+      const next: string[] = [];
+
+      for (let i = 0; i < frontier.length; i += BATCH) {
+        const slice = frontier.slice(i, i + BATCH);
+        const settled = await Promise.allSettled(
+          slice.map((folder) => this.listFolder(folder)),
+        );
+
+        for (let j = 0; j < settled.length; j++) {
+          const folder = slice[j];
+          const r = settled[j];
+          if (r.status === "rejected") {
+            // One folder failed — log it and continue. A single permission
+            // hiccup or transient API error must not abort the whole scan.
+            debugLog(`listAllFiles: skipping ${folder} after listFolder error: ${(r.reason as Error).message}`);
+            continue;
+          }
+          for (const f of r.value) {
+            if (f.isdir) {
+              next.push(f.path);
+            } else {
+              all.push(f);
+            }
+          }
         }
       }
+
+      frontier = next;
     }
+
     return all;
   }
 

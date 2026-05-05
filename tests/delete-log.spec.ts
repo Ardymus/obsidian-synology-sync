@@ -4,6 +4,8 @@ import {
   updateOwnShard,
   mergeShards,
   TOMBSTONES_DIR_NAME,
+  CLEARED_MARKER_NAME,
+  ClearedDoc,
   TombstoneFileStation,
   ShardDoc,
   TombstoneEntry,
@@ -21,6 +23,10 @@ function makeShardDoc(
 }
 
 function encodeDoc(doc: ShardDoc): ArrayBuffer {
+  return new TextEncoder().encode(JSON.stringify(doc)).buffer;
+}
+
+function encodeClearedDoc(doc: ClearedDoc): ArrayBuffer {
   return new TextEncoder().encode(JSON.stringify(doc)).buffer;
 }
 
@@ -308,8 +314,14 @@ describe("updateOwnShard", () => {
 
     await updateOwnShard(fs, REMOTE, ID, writes, purges);
 
-    expect(uploadMock).toHaveBeenCalledTimes(1);
-    const buf = uploadMock.mock.calls[0][2] as ArrayBuffer;
+    // First call writes the shard; second writes the cleared marker because purges
+    // are non-empty (cross-device suppression of stale tombstones).
+    expect(uploadMock).toHaveBeenCalledTimes(2);
+    const shardCall = uploadMock.mock.calls.find(
+      (c) => c[1] === `${ID}.json`,
+    );
+    expect(shardCall).toBeDefined();
+    const buf = shardCall![2] as ArrayBuffer;
     const doc: ShardDoc = JSON.parse(new TextDecoder().decode(buf));
 
     // 2 prior kept + 1 new = 3 total; purged one gone
@@ -413,5 +425,208 @@ describe("updateOwnShard", () => {
     expect(doc.syncIdentityId).toBe(ID);
     expect(doc.version).toBe(1);
     expect(typeof doc.last_updated).toBe("number");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-device purge propagation via _cleared.json
+// ---------------------------------------------------------------------------
+
+describe("readAllShards: _cleared.json suppression", () => {
+  const REMOTE = "/volume1/vault";
+  const TOMBSTONES_PATH = `${REMOTE}/${TOMBSTONES_DIR_NAME}`;
+  const MARKER_PATH = `${TOMBSTONES_PATH}/${CLEARED_MARKER_NAME}`;
+
+  it("suppresses a tombstone whose deleted_at is older than the cleared_at marker", async () => {
+    const shard = makeShardDoc("d1", { "kept.md": { deleted_at: 1000 } });
+    const cleared: ClearedDoc = {
+      version: 1,
+      clears: { "kept.md": { cleared_at: 2000 } },
+      last_updated: 2000,
+    };
+
+    const fs = makeFsStub({
+      listAllFiles: jest.fn().mockResolvedValue([
+        { path: `${TOMBSTONES_PATH}/d1.json`, name: "d1.json" },
+        { path: MARKER_PATH, name: CLEARED_MARKER_NAME },
+      ]),
+      download: jest.fn().mockImplementation((p: string) => {
+        if (p.endsWith("d1.json")) return Promise.resolve(encodeDoc(shard));
+        if (p === MARKER_PATH) return Promise.resolve(encodeClearedDoc(cleared));
+        return Promise.reject(new Error("unknown"));
+      }),
+    });
+
+    const result = await readAllShards(fs, REMOTE);
+    expect(result.has("kept.md")).toBe(false);
+  });
+
+  it("suppresses a tombstone with deleted_at equal to cleared_at (boundary, <=)", async () => {
+    const shard = makeShardDoc("d1", { "boundary.md": { deleted_at: 5000 } });
+    const cleared: ClearedDoc = {
+      version: 1,
+      clears: { "boundary.md": { cleared_at: 5000 } },
+      last_updated: 5000,
+    };
+
+    const fs = makeFsStub({
+      listAllFiles: jest.fn().mockResolvedValue([
+        { path: `${TOMBSTONES_PATH}/d1.json`, name: "d1.json" },
+        { path: MARKER_PATH, name: CLEARED_MARKER_NAME },
+      ]),
+      download: jest.fn().mockImplementation((p: string) => {
+        if (p.endsWith("d1.json")) return Promise.resolve(encodeDoc(shard));
+        if (p === MARKER_PATH) return Promise.resolve(encodeClearedDoc(cleared));
+        return Promise.reject(new Error("unknown"));
+      }),
+    });
+
+    const result = await readAllShards(fs, REMOTE);
+    expect(result.has("boundary.md")).toBe(false);
+  });
+
+  it("a newer tombstone still wins — deleted_at > cleared_at survives the marker", async () => {
+    const shard = makeShardDoc("d1", { "winning.md": { deleted_at: 9000 } });
+    const cleared: ClearedDoc = {
+      version: 1,
+      clears: { "winning.md": { cleared_at: 5000 } },
+      last_updated: 5000,
+    };
+
+    const fs = makeFsStub({
+      listAllFiles: jest.fn().mockResolvedValue([
+        { path: `${TOMBSTONES_PATH}/d1.json`, name: "d1.json" },
+        { path: MARKER_PATH, name: CLEARED_MARKER_NAME },
+      ]),
+      download: jest.fn().mockImplementation((p: string) => {
+        if (p.endsWith("d1.json")) return Promise.resolve(encodeDoc(shard));
+        if (p === MARKER_PATH) return Promise.resolve(encodeClearedDoc(cleared));
+        return Promise.reject(new Error("unknown"));
+      }),
+    });
+
+    const result = await readAllShards(fs, REMOTE);
+    expect(result.get("winning.md")).toEqual({ deleted_at: 9000 });
+  });
+
+  it("ignores a corrupt _cleared.json without throwing or suppressing tombstones", async () => {
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const shard = makeShardDoc("d1", { "live.md": { deleted_at: 1000 } });
+
+    const fs = makeFsStub({
+      listAllFiles: jest.fn().mockResolvedValue([
+        { path: `${TOMBSTONES_PATH}/d1.json`, name: "d1.json" },
+        { path: MARKER_PATH, name: CLEARED_MARKER_NAME },
+      ]),
+      download: jest.fn().mockImplementation((p: string) => {
+        if (p.endsWith("d1.json")) return Promise.resolve(encodeDoc(shard));
+        if (p === MARKER_PATH) {
+          // Wrong shape — missing `clears`
+          return Promise.resolve(
+            new TextEncoder().encode(JSON.stringify({ version: 1, last_updated: 1 })).buffer,
+          );
+        }
+        return Promise.reject(new Error("unknown"));
+      }),
+    });
+
+    const result = await readAllShards(fs, REMOTE);
+    expect(result.get("live.md")).toEqual({ deleted_at: 1000 });
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+});
+
+describe("updateOwnShard: _cleared.json write on purge", () => {
+  const REMOTE = "/volume1/vault";
+  const ID = "device-xyz";
+  const TOMBSTONES_PATH = `${REMOTE}/${TOMBSTONES_DIR_NAME}`;
+
+  it("writes _cleared.json when purges are non-empty", async () => {
+    const uploadMock = jest.fn().mockResolvedValue(undefined);
+    const fs = makeFsStub({
+      download: jest.fn().mockRejectedValue(new Error("not found")),
+      upload: uploadMock,
+    });
+
+    await updateOwnShard(
+      fs,
+      REMOTE,
+      ID,
+      new Map(),
+      new Set(["purged.md"]),
+    );
+
+    const markerCall = uploadMock.mock.calls.find(
+      (c) => c[1] === CLEARED_MARKER_NAME,
+    );
+    expect(markerCall).toBeDefined();
+    expect(markerCall![0]).toBe(TOMBSTONES_PATH);
+
+    const marker: ClearedDoc = JSON.parse(
+      new TextDecoder().decode(markerCall![2] as ArrayBuffer),
+    );
+    expect(marker.version).toBe(1);
+    expect(marker.clears["purged.md"]).toBeDefined();
+    expect(typeof marker.clears["purged.md"].cleared_at).toBe("number");
+  });
+
+  it("does NOT write _cleared.json when purges are empty", async () => {
+    const uploadMock = jest.fn().mockResolvedValue(undefined);
+    const fs = makeFsStub({
+      download: jest.fn().mockRejectedValue(new Error("not found")),
+      upload: uploadMock,
+    });
+
+    await updateOwnShard(
+      fs,
+      REMOTE,
+      ID,
+      new Map([["new.md", { deleted_at: 1 }]]),
+      new Set(),
+    );
+
+    const markerCall = uploadMock.mock.calls.find(
+      (c) => c[1] === CLEARED_MARKER_NAME,
+    );
+    expect(markerCall).toBeUndefined();
+  });
+
+  it("merges new purges into an existing _cleared.json without dropping prior clears", async () => {
+    const MARKER_PATH = `${TOMBSTONES_PATH}/${CLEARED_MARKER_NAME}`;
+    const OWN_SHARD_PATH = `${TOMBSTONES_PATH}/${ID}.json`;
+    const existingMarker: ClearedDoc = {
+      version: 1,
+      clears: { "old-clear.md": { cleared_at: 100 } },
+      last_updated: 100,
+    };
+
+    const uploadMock = jest.fn().mockResolvedValue(undefined);
+    const fs = makeFsStub({
+      download: jest.fn().mockImplementation((p: string) => {
+        if (p === MARKER_PATH) return Promise.resolve(encodeClearedDoc(existingMarker));
+        if (p === OWN_SHARD_PATH) return Promise.reject(new Error("not found"));
+        return Promise.reject(new Error("unknown"));
+      }),
+      upload: uploadMock,
+    });
+
+    await updateOwnShard(
+      fs,
+      REMOTE,
+      ID,
+      new Map(),
+      new Set(["new-clear.md"]),
+    );
+
+    const markerCall = uploadMock.mock.calls.find(
+      (c) => c[1] === CLEARED_MARKER_NAME,
+    );
+    expect(markerCall).toBeDefined();
+    const marker: ClearedDoc = JSON.parse(
+      new TextDecoder().decode(markerCall![2] as ArrayBuffer),
+    );
+    expect(marker.clears["old-clear.md"]).toEqual({ cleared_at: 100 });
+    expect(marker.clears["new-clear.md"]).toBeDefined();
   });
 });

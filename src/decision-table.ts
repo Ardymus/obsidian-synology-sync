@@ -42,13 +42,23 @@ export interface DecideConfig {
 // ---------------------------------------------------------------------------
 // Helper: mtime gate — returns true when `mtime` is newer than the delete
 // event (with jitter tolerance), meaning the file was re-created.
+//
+// A malformed `deleted_at` (non-finite, zero/negative, or implausibly far in
+// the future) is untrustworthy and we refuse to act on it.  Returning `true`
+// in those cases routes Rows 4/8/10 down the "live-data wins" branches
+// (keep-local-purge-tombstone / recreate-after-delete) so that a corrupt or
+// hostile shard cannot trick the engine into deleting a real file.
 // ---------------------------------------------------------------------------
 function mtimeBeatsTombstone(
   mtime: number,
   tombstone: TombstoneEntry,
   jitterMs: number,
 ): boolean {
-  return mtime > tombstone.deleted_at + jitterMs;
+  const d = tombstone.deleted_at;
+  if (!Number.isFinite(d) || d <= 0 || d > Date.now() + 60_000) {
+    return true;
+  }
+  return mtime > d + jitterMs;
 }
 
 // ---------------------------------------------------------------------------

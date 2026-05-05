@@ -76,15 +76,15 @@ describe("Row 4: L — H T", () => {
   it("returns keep-local-purge-tombstone when local.mtime > deleted_at + jitter (post-delete edit)", () => {
     // User edited the file AFTER a peer's delete propagated; preserve their work.
     const localEdited = { mtime: 10000, size: 100 };
-    const tombstone = { deleted_at: 0 };
+    const tombstone = { deleted_at: 1000 };
     const cfg = { ...baseCfg, tombstoneJitterMs: 5000 };
     const result = decideAction(localEdited, undefined, H, tombstone, cfg);
     expect(result).toEqual<Action>({ kind: "keep-local-purge-tombstone" });
   });
 
   it("returns delete-local on boundary (local.mtime === deleted_at + jitter, strict >)", () => {
-    const localBoundary = { mtime: 5000, size: 100 };
-    const tombstone = { deleted_at: 0 };
+    const localBoundary = { mtime: 6000, size: 100 };
+    const tombstone = { deleted_at: 1000 };
     const cfg = { ...baseCfg, tombstoneJitterMs: 5000 };
     const result = decideAction(localBoundary, undefined, H, tombstone, cfg);
     expect(result).toEqual<Action>({ kind: "delete-local" });
@@ -285,9 +285,9 @@ describe("Edge: Row 6 with honorTombstoneOnRecreate=true → delete-local", () =
 
 describe("Edge: Row 8 mtime gate positive (remote 10s after deleted_at, jitter=5s)", () => {
   it("returns recreate-after-delete", () => {
-    // remote mtime = 10000, deleted_at = 0, jitter = 5000 → 10000 > 5000 ✓
-    const rEntry = { mtime: 10000, size: 100 };
-    const tombstone = { deleted_at: 0 };
+    // remote mtime = 11000, deleted_at = 1000, jitter = 5000 → 11000 > 6000 ✓
+    const rEntry = { mtime: 11000, size: 100 };
+    const tombstone = { deleted_at: 1000 };
     const cfg = { ...baseCfg, tombstoneJitterMs: 5000 };
     const result = decideAction(undefined, rEntry, H, tombstone, cfg);
     expect(result).toEqual<Action>({ kind: "recreate-after-delete", purgeTombstone: true });
@@ -296,9 +296,9 @@ describe("Edge: Row 8 mtime gate positive (remote 10s after deleted_at, jitter=5
 
 describe("Edge: Row 8 mtime gate boundary (remote exactly deleted_at + jitter) → delete-remote-stale-tombstone", () => {
   it("returns delete-remote-stale-tombstone (strict >) when equal", () => {
-    // remote mtime = 5000, deleted_at = 0, jitter = 5000 → 5000 > 5000? No
-    const rEntry = { mtime: 5000, size: 100 };
-    const tombstone = { deleted_at: 0 };
+    // remote mtime = 6000, deleted_at = 1000, jitter = 5000 → 6000 > 6000? No
+    const rEntry = { mtime: 6000, size: 100 };
+    const tombstone = { deleted_at: 1000 };
     const cfg = { ...baseCfg, tombstoneJitterMs: 5000 };
     const result = decideAction(undefined, rEntry, H, tombstone, cfg);
     expect(result).toEqual<Action>({ kind: "delete-remote-stale-tombstone" });
@@ -307,8 +307,8 @@ describe("Edge: Row 8 mtime gate boundary (remote exactly deleted_at + jitter) �
 
 describe("Edge: Row 10 mtime gate positive → recreate-after-delete", () => {
   it("returns recreate-after-delete", () => {
-    const rEntry = { mtime: 10000, size: 100 };
-    const tombstone = { deleted_at: 0 };
+    const rEntry = { mtime: 11000, size: 100 };
+    const tombstone = { deleted_at: 1000 };
     const cfg = { ...baseCfg, tombstoneJitterMs: 5000 };
     const result = decideAction(undefined, rEntry, undefined, tombstone, cfg);
     expect(result).toEqual<Action>({ kind: "recreate-after-delete", purgeTombstone: true });
@@ -318,7 +318,7 @@ describe("Edge: Row 10 mtime gate positive → recreate-after-delete", () => {
 describe("Edge: Row 10 mtime gate negative → delete-remote-stale-tombstone", () => {
   it("returns delete-remote-stale-tombstone", () => {
     const rEntry = { mtime: 5000, size: 100 };
-    const tombstone = { deleted_at: 0 };
+    const tombstone = { deleted_at: 1000 };
     const cfg = { ...baseCfg, tombstoneJitterMs: 5000 };
     const result = decideAction(undefined, rEntry, undefined, tombstone, cfg);
     expect(result).toEqual<Action>({ kind: "delete-remote-stale-tombstone" });
@@ -346,5 +346,75 @@ describe("Edge: Row 16 → conflict-resolve + purgeTombstone:true", () => {
       strategy: "remote-wins",
       purgeTombstone: true,
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hardened mtimeBeatsTombstone: malformed `deleted_at` must NOT trick the
+// engine into deleting a real file.  In every gated row the safe outcome is
+// the "live data wins" branch:
+//   Row 4  (L — H T)   → keep-local-purge-tombstone
+//   Row 8  (— R H T)   → recreate-after-delete
+//   Row 10 (— R — T)   → recreate-after-delete
+// ---------------------------------------------------------------------------
+describe("mtimeBeatsTombstone hardening: malformed deleted_at", () => {
+  const cfg = { ...baseCfg, tombstoneJitterMs: 5000 };
+
+  it("Row 4: deleted_at=0 → keep-local-purge-tombstone (refuses to act on bogus tombstone)", () => {
+    const tombstone = { deleted_at: 0 };
+    const result = decideAction(L, undefined, H, tombstone, cfg);
+    expect(result).toEqual<Action>({ kind: "keep-local-purge-tombstone" });
+  });
+
+  it("Row 4: deleted_at=-1 → keep-local-purge-tombstone", () => {
+    const tombstone = { deleted_at: -1 };
+    const result = decideAction(L, undefined, H, tombstone, cfg);
+    expect(result).toEqual<Action>({ kind: "keep-local-purge-tombstone" });
+  });
+
+  it("Row 4: deleted_at far in the future → keep-local-purge-tombstone", () => {
+    const tombstone = { deleted_at: Date.now() + 120_000 };
+    const result = decideAction(L, undefined, H, tombstone, cfg);
+    expect(result).toEqual<Action>({ kind: "keep-local-purge-tombstone" });
+  });
+
+  it("Row 4: NaN deleted_at → keep-local-purge-tombstone", () => {
+    const tombstone = { deleted_at: Number.NaN };
+    const result = decideAction(L, undefined, H, tombstone, cfg);
+    expect(result).toEqual<Action>({ kind: "keep-local-purge-tombstone" });
+  });
+
+  it("Row 8: deleted_at=0 → recreate-after-delete", () => {
+    const tombstone = { deleted_at: 0 };
+    const result = decideAction(undefined, R, H, tombstone, cfg);
+    expect(result).toEqual<Action>({ kind: "recreate-after-delete", purgeTombstone: true });
+  });
+
+  it("Row 8: deleted_at far in the future → recreate-after-delete", () => {
+    const tombstone = { deleted_at: Date.now() + 120_000 };
+    const result = decideAction(undefined, R, H, tombstone, cfg);
+    expect(result).toEqual<Action>({ kind: "recreate-after-delete", purgeTombstone: true });
+  });
+
+  it("Row 10: deleted_at=-1 → recreate-after-delete", () => {
+    const tombstone = { deleted_at: -1 };
+    const result = decideAction(undefined, R, undefined, tombstone, cfg);
+    expect(result).toEqual<Action>({ kind: "recreate-after-delete", purgeTombstone: true });
+  });
+
+  it("Row 10: Infinity deleted_at → recreate-after-delete", () => {
+    const tombstone = { deleted_at: Number.POSITIVE_INFINITY };
+    const result = decideAction(undefined, R, undefined, tombstone, cfg);
+    expect(result).toEqual<Action>({ kind: "recreate-after-delete", purgeTombstone: true });
+  });
+
+  it("valid past deleted_at still gates normally (Row 8)", () => {
+    // Sanity: a well-formed tombstone with mtime <= deleted_at + jitter still
+    // routes to delete-remote-stale-tombstone.
+    const past = Date.now() - 60_000;
+    const tombstone = { deleted_at: past };
+    const rEntry = { mtime: past - 1000, size: 100 };
+    const result = decideAction(undefined, rEntry, H, tombstone, cfg);
+    expect(result).toEqual<Action>({ kind: "delete-remote-stale-tombstone" });
   });
 });
