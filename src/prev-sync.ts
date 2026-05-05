@@ -193,6 +193,19 @@ export interface SnapshotInputs {
   erroredPaths: Set<string>;
   /** Timestamp to stamp on entries (Date.now() at snapshot time). */
   now: number;
+  /**
+   * Timestamp recorded at the very start of the sync cycle (Date.now()).
+   * Files whose freshLocal mtime is newer than this were modified by the user
+   * DURING the sync. They are excluded from clean history unless their stat
+   * exactly matches a stat the sync itself wrote (syncedLocalStats).
+   */
+  syncStartTs?: number;
+  /**
+   * Stats of files actually written by this sync cycle (uploads and downloads).
+   * Keyed by relative path. Used to distinguish "sync wrote this" from
+   * "user wrote this during the sync window".
+   */
+  syncedLocalStats?: Map<string, { mtime: number; size: number }>;
 }
 
 /**
@@ -209,10 +222,24 @@ export interface SnapshotInputs {
  * path as "never-seen" → Row 9 → resurrection.
  */
 export function buildPrevSyncSnapshot(inputs: SnapshotInputs): PrevSyncMap {
-  const { freshLocal, preSyncRemote, priorHistory, erroredPaths, now } = inputs;
+  const { freshLocal, preSyncRemote, priorHistory, erroredPaths, now, syncStartTs, syncedLocalStats } = inputs;
   const snapshot: PrevSyncMap = new Map();
 
   for (const [path, stat] of freshLocal) {
+    // If syncStartTs is set, a file modified after the sync started was
+    // written by the user during the sync window.  Do not record it as
+    // cleanly synced — unless the sync itself wrote that exact stat.
+    if (syncStartTs !== undefined && stat.mtime > syncStartTs) {
+      const syncedStat = syncedLocalStats?.get(path);
+      if (!syncedStat || syncedStat.mtime !== stat.mtime || syncedStat.size !== stat.size) {
+        // User modified this file during sync; carry prior history if any,
+        // so the next cycle re-evaluates it rather than recording a dirty state.
+        const prior = priorHistory.get(path);
+        if (prior) snapshot.set(path, { ...prior });
+        continue;
+      }
+    }
+
     const prior = priorHistory.get(path);
     const wasRemoteAtStart = preSyncRemote.has(path);
     const priorMissing = prior?.missingCount ?? 0;

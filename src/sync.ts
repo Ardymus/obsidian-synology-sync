@@ -126,6 +126,14 @@ export class SyncEngine {
     // that case is unconditionally honoured now (which is the fix).
     void deleteOrphans;
 
+    // Record the sync start time. Any local file whose mtime is newer than
+    // this was written by the user DURING the sync window and must not be
+    // recorded as cleanly synced (unless the sync itself wrote that stat).
+    const syncStartTs = Date.now();
+
+    // Tracks stats of files actually written by this sync cycle.
+    const syncedLocalStats = new Map<string, { mtime: number; size: number }>();
+
     const result: SyncResult = {
       uploaded: [],
       downloaded: [],
@@ -203,6 +211,7 @@ export class SyncEngine {
           pendingShardWrites,
           pendingShardPurges,
           result,
+          syncedLocalStats,
         );
       } catch (e) {
         const errMsg = (e as Error).message;
@@ -251,6 +260,8 @@ export class SyncEngine {
         priorHistory: history,
         erroredPaths,
         now: Date.now(),
+        syncStartTs,
+        syncedLocalStats,
       });
       await writePrevSync(this.adapter, snapshot);
     } catch (e) {
@@ -275,17 +286,21 @@ export class SyncEngine {
     pendingShardWrites: Map<string, ShardTombstoneEntry>,
     pendingShardPurges: Set<string>,
     result: SyncResult,
+    syncedLocalStats: Map<string, { mtime: number; size: number }>,
   ): Promise<void> {
     switch (action.kind) {
       case "upload":
         await this.uploadFile(path);
+        this.recordLocalStat(path, syncedLocalStats);
         result.uploaded.push(path);
         return;
 
       case "download":
         if (!remote) return;
-        await this.downloadFile(path, remote.fullPath);
-        result.downloaded.push(path);
+        if (await this.downloadFile(path, remote.fullPath, local, remote, this.conflictStrategy, result)) {
+          this.recordLocalStat(path, syncedLocalStats);
+          result.downloaded.push(path);
+        }
         return;
 
       case "delete-local":
@@ -314,8 +329,10 @@ export class SyncEngine {
         // Rows 8 & 10 positive mtime gate: remote (or local) is newer than the
         // tombstone → treat as a legitimate recreate. Keep remote, clear entry.
         if (remote) {
-          await this.downloadFile(path, remote.fullPath);
-          result.downloaded.push(path);
+          if (await this.downloadFile(path, remote.fullPath, local, remote, this.conflictStrategy, result)) {
+            this.recordLocalStat(path, syncedLocalStats);
+            result.downloaded.push(path);
+          }
         }
         pendingShardPurges.add(path);
         result.recreated.push(path);
@@ -323,13 +340,14 @@ export class SyncEngine {
 
       case "keep-local-purge-tombstone":
         await this.uploadFile(path);
+        this.recordLocalStat(path, syncedLocalStats);
         result.uploaded.push(path);
         pendingShardPurges.add(path);
         result.preservedLocal.push(path);
         return;
 
       case "conflict-resolve":
-        await this.conflictResolve(path, local, remote, action.strategy, result);
+        await this.conflictResolve(path, local, remote, action.strategy, result, syncedLocalStats);
         if (action.purgeTombstone) pendingShardPurges.add(path);
         return;
 
@@ -344,12 +362,28 @@ export class SyncEngine {
     }
   }
 
+  /**
+   * After a successful upload or download, capture the file's post-write stat
+   * so the prev-sync snapshot can distinguish "sync wrote this" from "user
+   * wrote this during the sync window".
+   */
+  private recordLocalStat(
+    path: string,
+    syncedLocalStats: Map<string, { mtime: number; size: number }>,
+  ): void {
+    const file = this.vault.getAbstractFileByPath(path);
+    if (file instanceof TFile) {
+      syncedLocalStats.set(path, { mtime: file.stat.mtime, size: file.stat.size });
+    }
+  }
+
   private async conflictResolve(
     path: string,
     local: LocalEntry | undefined,
     remote: (RemoteEntry & { fullPath: string }) | undefined,
     strategy: ConflictStrategy,
     result: SyncResult,
+    syncedLocalStats: Map<string, { mtime: number; size: number }>,
   ): Promise<void> {
     if (!local || !remote) return; // defensive — conflict requires both
 
@@ -363,19 +397,25 @@ export class SyncEngine {
       case "newer-wins":
         if (local.mtime > remote.mtime) {
           await this.uploadFile(path);
+          this.recordLocalStat(path, syncedLocalStats);
           result.uploaded.push(path);
         } else if (remote.mtime > local.mtime) {
-          await this.downloadFile(path, remote.fullPath);
-          result.downloaded.push(path);
+          if (await this.downloadFile(path, remote.fullPath, local, remote, strategy, result)) {
+            this.recordLocalStat(path, syncedLocalStats);
+            result.downloaded.push(path);
+          }
         }
         return;
       case "local-wins":
         await this.uploadFile(path);
+        this.recordLocalStat(path, syncedLocalStats);
         result.uploaded.push(path);
         return;
       case "remote-wins":
-        await this.downloadFile(path, remote.fullPath);
-        result.downloaded.push(path);
+        if (await this.downloadFile(path, remote.fullPath, local, remote, strategy, result)) {
+          this.recordLocalStat(path, syncedLocalStats);
+          result.downloaded.push(path);
+        }
         return;
       case "skip":
         result.conflicts.push(path);
@@ -424,7 +464,56 @@ export class SyncEngine {
     await this.fs.upload(remoteDir, fileName, content, true, file.stat.mtime);
   }
 
-  private async downloadFile(relativePath: string, remoteFullPath: string): Promise<void> {
+  /**
+   * Downloads `remoteFullPath` and writes it to `relativePath`.
+   *
+   * Returns `true` when the local file was overwritten, `false` when the
+   * download was skipped because the user modified the local file between
+   * the initial scan and now (mid-sync write protection).
+   *
+   * The pre-write re-check compares the live local mtime against `local.mtime`
+   * (captured at the start of this sync cycle).  When the local mtime has
+   * advanced, the conflict strategy decides:
+   *   - local-wins  → always skip (user's edit beats the remote copy);
+   *   - newer-wins  → skip iff fresh local mtime > remote mtime;
+   *   - remote-wins → never skip; remote always overwrites.
+   *
+   * Skipped paths land in `result.conflicts` instead of `result.downloaded`.
+   *
+   * Note: Adapter.rename has a confirmed bug — it throws "Destination file
+   * already exists!" whenever the destination exists — so we cannot use a
+   * tmp-then-rename atomic-write workaround here.  A small TOCTOU window
+   * between the live-mtime read and the modifyBinary call remains; closing
+   * it would require an Obsidian API change (or a vault event listener,
+   * which is explicitly deferred).
+   */
+  private async downloadFile(
+    relativePath: string,
+    remoteFullPath: string,
+    local: LocalEntry | undefined,
+    remote: RemoteEntry | undefined,
+    conflictStrategy: ConflictStrategy,
+    result: SyncResult,
+  ): Promise<boolean> {
+    // Check live local mtime against the initial-scan mtime BEFORE we touch
+    // the network — if the user edited the file mid-sync, we may skip
+    // entirely and avoid wasted bandwidth.
+    const existingPre = this.vault.getAbstractFileByPath(relativePath);
+    if (existingPre instanceof TFile && local !== undefined) {
+      const liveMtime = existingPre.stat.mtime;
+      if (liveMtime > local.mtime) {
+        const skip =
+          conflictStrategy === "local-wins" ||
+          (conflictStrategy === "newer-wins" &&
+            (remote === undefined || liveMtime > remote.mtime));
+        if (skip) {
+          debugLog(`[sync] mid-sync write detected for ${relativePath}; skipping download (strategy=${conflictStrategy}).`);
+          result.conflicts.push(relativePath);
+          return false;
+        }
+      }
+    }
+
     const content = await this.fs.download(remoteFullPath);
 
     // Ensure local directory exists
@@ -449,5 +538,6 @@ export class SyncEngine {
       // Use adapter.writeBinary for files outside the vault index (e.g. .obsidian/ configs)
       await this.vault.adapter.writeBinary(relativePath, content);
     }
+    return true;
   }
 }

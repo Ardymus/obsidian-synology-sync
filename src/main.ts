@@ -2,7 +2,7 @@ import { Plugin, Notice, Modal, App } from "obsidian";
 import { FileStation, FileStationConfig, LoginResult } from "./filestation";
 import { resolveQuickConnect } from "./quickconnect";
 import { SyncEngine, SyncResult } from "./sync";
-import { SynologySyncSettings, SynologySyncSettingTab, DEFAULT_SETTINGS } from "./settings";
+import { SynologySyncSettings, SynologySyncSettingTab, DEFAULT_SETTINGS, migrateLoadedSettings } from "./settings";
 import { debugLog, getDebugLog } from "./debug";
 
 // UUID generator with fallbacks for older runtimes.
@@ -87,6 +87,9 @@ export default class SynologySync extends Plugin {
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    if (migrateLoadedSettings(this.settings)) {
+      await this.saveSettings();
+    }
     if (!this.settings.syncIdentityId) {
       this.settings.syncIdentityId = generateSyncIdentityId();
       await this.saveSettings();

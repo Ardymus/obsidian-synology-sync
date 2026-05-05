@@ -37,6 +37,21 @@ export interface ShardDoc {
 
 export const TOMBSTONES_DIR_NAME = ".sync-tombstones";
 
+// Shared marker file that suppresses tombstones across all devices.
+// Written when a device keeps a file via keep-local-purge-tombstone (Row 6),
+// so peer devices stop honoring the stale per-device shard tombstones.
+export const CLEARED_MARKER_NAME = "_cleared.json";
+
+export interface ClearEntry {
+  cleared_at: number;
+}
+
+export interface ClearedDoc {
+  version: 1;
+  clears: Record<string, ClearEntry>;
+  last_updated: number;
+}
+
 /**
  * Returns `${remotePath}/.sync-tombstones/${syncIdentityId}.json`,
  * normalising away any trailing slash on remotePath.
@@ -90,9 +105,9 @@ export async function readAllShards(
   }
 
   const docs: ShardDoc[] = [];
+  let clearedDoc: ClearedDoc | null = null;
 
   for (const file of files) {
-    // Only process .json files
     const name = file.name ?? file.path.split("/").pop() ?? "";
     if (!name.endsWith(".json")) {
       continue;
@@ -121,6 +136,15 @@ export async function readAllShards(
       continue;
     }
 
+    if (name === CLEARED_MARKER_NAME) {
+      if (isClearedDoc(doc)) {
+        clearedDoc = doc;
+      } else {
+        console.warn(`[delete-log] Corrupt cleared marker ${file.path}, skipping.`);
+      }
+      continue;
+    }
+
     if (!isShardDoc(doc)) {
       console.warn(
         `[delete-log] Corrupt shard (invalid shape) ${file.path}, skipping.`,
@@ -131,7 +155,22 @@ export async function readAllShards(
     docs.push(doc);
   }
 
-  return mergeShards(docs);
+  const merged = mergeShards(docs);
+
+  // Apply the cleared marker: suppress any tombstone whose deleted_at is
+  // older than or equal to the clear timestamp recorded for that path.
+  // A newer tombstone (deleted_at > cleared_at) still wins — it represents
+  // a subsequent deletion on another device.
+  if (clearedDoc) {
+    for (const [path, clearEntry] of Object.entries(clearedDoc.clears)) {
+      const tombstone = merged.get(path);
+      if (tombstone && tombstone.deleted_at <= clearEntry.cleared_at) {
+        merged.delete(path);
+      }
+    }
+  }
+
+  return merged;
 }
 
 /**
@@ -184,20 +223,86 @@ export async function updateOwnShard(
     prior[filePath] = { deleted_at: entry.deleted_at };
   }
 
+  const now = Date.now();
   const doc: ShardDoc = {
     version: 1,
     syncIdentityId,
     tombstones: prior,
-    last_updated: Date.now(),
+    last_updated: now,
   };
 
   const encoded = new TextEncoder().encode(JSON.stringify(doc)).buffer;
   await fs.upload(tombstonesDir, fileName, encoded, true);
+
+  // If any paths were purged, update the shared cleared marker so peer devices
+  // stop honoring stale tombstones for those paths.
+  if (purges.size > 0) {
+    await writeClearedMarker(fs, tombstonesDir, purges, now);
+  }
+}
+
+/**
+ * Reads the existing _cleared.json (if any), merges in the new purge set,
+ * and writes the updated marker back to the NAS.
+ */
+async function writeClearedMarker(
+  fs: TombstoneFileStation,
+  tombstonesDir: string,
+  purges: Set<string>,
+  now: number,
+): Promise<void> {
+  const markerPath = `${tombstonesDir}/${CLEARED_MARKER_NAME}`;
+
+  // Load existing marker
+  const existingClears: Record<string, ClearEntry> = {};
+  try {
+    const buf = await fs.download(markerPath);
+    const text = new TextDecoder().decode(buf);
+    const parsed: unknown = JSON.parse(text);
+    if (isClearedDoc(parsed)) {
+      Object.assign(existingClears, parsed.clears);
+    }
+  } catch {
+    // No existing marker or parse failure — start fresh
+  }
+
+  // Merge purges: update cleared_at to now for each purged path
+  for (const path of purges) {
+    existingClears[path] = { cleared_at: now };
+  }
+
+  const marker: ClearedDoc = {
+    version: 1,
+    clears: existingClears,
+    last_updated: now,
+  };
+
+  const encoded = new TextEncoder().encode(JSON.stringify(marker)).buffer;
+  await fs.upload(tombstonesDir, CLEARED_MARKER_NAME, encoded, true);
 }
 
 // ---------------------------------------------------------------------------
-// Internal type guard
+// Internal type guards
 // ---------------------------------------------------------------------------
+
+function isClearedDoc(val: unknown): val is ClearedDoc {
+  if (typeof val !== "object" || val === null) return false;
+  const obj = val as Record<string, unknown>;
+  if (obj["version"] !== 1) return false;
+  if (typeof obj["last_updated"] !== "number") return false;
+  if (typeof obj["clears"] !== "object" || obj["clears"] === null) return false;
+  const clears = obj["clears"] as Record<string, unknown>;
+  for (const entry of Object.values(clears)) {
+    if (
+      typeof entry !== "object" ||
+      entry === null ||
+      typeof (entry as Record<string, unknown>)["cleared_at"] !== "number"
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
 
 function isShardDoc(val: unknown): val is ShardDoc {
   if (typeof val !== "object" || val === null) return false;
