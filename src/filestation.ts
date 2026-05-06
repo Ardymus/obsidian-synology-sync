@@ -131,8 +131,39 @@ export class FileStation {
     }, LOGIN_TIMEOUT_MS, "relay entry.cgi login request");
   }
 
+  /**
+   * Inspect a login response for a HTML body (e.g. DSM portal login page returned
+   * with HTTP 200 when a saved device token has expired). Returns the parsed JSON
+   * data when the body is JSON; throws a clear, user-actionable error otherwise.
+   *
+   * Side effect: clears `this.config.deviceToken` when HTML is detected so the next
+   * login attempt falls back to a fresh credential login.
+   */
+  private parseLoginResponse(resp: RequestUrlResponse): any {
+    const text = resp.text ?? "";
+    const ct = ((resp as any).headers?.["content-type"] ?? (resp as any).headers?.["Content-Type"] ?? "") as string;
+    const looksHtml = /text\/html/i.test(ct) || /^\s*</.test(text);
+    if (looksHtml) {
+      const preview = text.slice(0, 120).replace(/\s+/g, " ");
+      debugLog(`AUTH: NAS returned HTML on login (status=${resp.status}, content-type=${ct || "(unset)"}, body[0..120]=${preview})`);
+      // Clear the saved device token so the next attempt tries a fresh credential login.
+      this.config.deviceToken = undefined;
+      throw new Error("Synology login failed: NAS returned an HTML page instead of JSON. Your saved device token may have expired — open plugin settings and re-save to re-authenticate.");
+    }
+    try {
+      return JSON.parse(text);
+    } catch {
+      // Fall back to resp.json in case the host runtime did not populate `text`
+      // (the real Obsidian RequestUrlResponse always provides both, but tests/mocks
+      // may only set one). If that also fails, throw a clear error.
+      const j = (resp as any).json;
+      if (j && typeof j === "object") return j;
+      throw new Error("Synology login failed: response was not valid JSON");
+    }
+  }
+
   async login(): Promise<LoginResult> {
-    const params = this.buildLoginParams();
+    let params = this.buildLoginParams();
 
     debugLog(`AUTH: baseUrl=${this.config.baseUrl}`);
     debugLog(`AUTH: user=${this.config.username}`);
@@ -158,12 +189,41 @@ export class FileStation {
       throw e;
     }
 
-    const data = resp.json;
+    let data = this.parseLoginResponse(resp);
     if (!data || typeof data !== "object") {
       debugLog("AUTH: response was not JSON object");
       throw new Error("Synology login failed: File Station API returned a non-JSON response");
     }
     debugLog(`AUTH: response success=${data.success}`);
+
+    // Fix B: one-shot retry when DSM rejects a saved device token (code 403 with
+    // device_id present in the request). Without this we surface a confusing
+    // "2FA code required" error to a user who expected their device to be trusted.
+    if (!data.success && data.error?.code === 403 && this.config.deviceToken) {
+      debugLog("AUTH: device token rejected (code 403); retrying without device token");
+      this.config.deviceToken = undefined;
+      params = this.buildLoginParams();
+      let retryResp: RequestUrlResponse;
+      try {
+        retryResp = await this.requestLogin(params);
+      } catch (e) {
+        if (isLikelyHtmlResponse(e)) {
+          debugLog("AUTH: retry login endpoint returned HTML/non-JSON");
+          throw new Error("Synology login failed: selected QuickConnect endpoint returned HTML instead of File Station API JSON");
+        }
+        debugLog(`AUTH: retry request failed: ${(e as Error).message}`);
+        throw e;
+      }
+      data = this.parseLoginResponse(retryResp);
+      if (!data || typeof data !== "object") {
+        throw new Error("Synology login failed: File Station API returned a non-JSON response");
+      }
+      debugLog(`AUTH: retry response success=${data.success}`);
+      if (!data.success && data.error?.code === 403) {
+        throw new Error("Synology login failed: 2FA code required (device token rejected; re-enter OTP)");
+      }
+    }
+
     if (data.success) {
       const keys = Object.keys(data.data || {});
       debugLog(`AUTH: response keys=${keys.join(",")}`);
@@ -226,6 +286,31 @@ export class FileStation {
     };
   }
 
+  /**
+   * Parse a non-login FileStation response. Detects HTML bodies (DSM session
+   * expiry returns a portal page with HTTP 200) and surfaces a clear error
+   * instead of letting `resp.json` throw an opaque "Unrecognized token '<'".
+   */
+  private parseJson(resp: RequestUrlResponse, label: string): any {
+    const text = resp.text ?? "";
+    if (/^\s*</.test(text)) {
+      debugLog(`${label}: NAS returned HTML (status=${resp.status}); session may have expired`);
+      throw new Error(`${label}: NAS returned an HTML page — session may have expired`);
+    }
+    if (text) {
+      try {
+        return JSON.parse(text);
+      } catch (e) {
+        // Some test mocks supply only `json`. Fall back if parse of `text` failed.
+        const j = (resp as any).json;
+        if (j !== undefined) return j;
+        throw new Error(`${label}: invalid JSON from NAS: ${(e as Error).message}`);
+      }
+    }
+    // No `text` — defer to whatever the runtime parsed.
+    return (resp as any).json;
+  }
+
   async logout(): Promise<void> {
     if (!this.sid) return;
     try {
@@ -253,8 +338,9 @@ export class FileStation {
       }),
       method: "GET",
     });
-    if (!resp.json.success) throw new Error(`list_share failed: ${JSON.stringify(resp.json.error)}`);
-    return resp.json.data.shares;
+    const data = this.parseJson(resp, "listShares");
+    if (!data.success) throw new Error(`list_share failed: ${JSON.stringify(data.error)}`);
+    return data.data.shares;
   }
 
   async listFolder(folderPath: string): Promise<FileInfo[]> {
@@ -270,8 +356,9 @@ export class FileStation {
       }),
       method: "GET",
     });
-    if (!resp.json.success) throw new Error(`list failed: ${JSON.stringify(resp.json.error)}`);
-    return resp.json.data.files;
+    const data = this.parseJson(resp, "listFolder");
+    if (!data.success) throw new Error(`list failed: ${JSON.stringify(data.error)}`);
+    return data.data.files;
   }
 
   async listAllFiles(basePath: string): Promise<FileInfo[]> {
@@ -373,8 +460,9 @@ export class FileStation {
       body: body.buffer,
     });
 
-    if (!resp.json.success) {
-      throw new Error(`Upload failed for ${fileName}: ${JSON.stringify(resp.json.error)}`);
+    const uploadData = this.parseJson(resp, "upload");
+    if (!uploadData.success) {
+      throw new Error(`Upload failed for ${fileName}: ${JSON.stringify(uploadData.error)}`);
     }
   }
 
@@ -391,9 +479,10 @@ export class FileStation {
       method: "GET",
     });
     // Ignore "already exists" (1100) and "folder exists" (414) errors
-    const errCode = resp.json.error?.code;
-    if (!resp.json.success && errCode !== 1100 && errCode !== 414) {
-      throw new Error(`createFolder failed: ${JSON.stringify(resp.json.error)}`);
+    const cfData = this.parseJson(resp, "createFolder");
+    const errCode = cfData.error?.code;
+    if (!cfData.success && errCode !== 1100 && errCode !== 414) {
+      throw new Error(`createFolder failed: ${JSON.stringify(cfData.error)}`);
     }
   }
 
