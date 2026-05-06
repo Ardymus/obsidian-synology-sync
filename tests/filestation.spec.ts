@@ -77,6 +77,143 @@ describe("FileStation", () => {
     jest.useRealTimers();
   });
 
+  describe("login HTML hardening", () => {
+    it("throws an actionable error when direct login returns an HTML body with HTTP 200", async () => {
+      // 200 OK with an HTML portal page — the failure mode we hit when a
+      // device token expires after ~11 days idle. resp.json must NEVER be
+      // touched on this path; if it were, this getter would throw and the
+      // test would observe a different message.
+      mockedRequestUrl.mockResolvedValueOnce({
+        status: 200,
+        headers: { "content-type": "text/html; charset=UTF-8" },
+        text: "<!DOCTYPE html><html><body>Login portal</body></html>",
+        get json() {
+          throw new Error("JSON Parse error: Unrecognized token '<'");
+        },
+      });
+
+      const fs = new FileStation({
+        baseUrl: "https://nas.local:5001",
+        username: "user",
+        password: "pass",
+        deviceToken: "stale-token",
+      });
+
+      const err = await fs.login().then(
+        () => { throw new Error("expected login() to reject"); },
+        (e: Error) => e,
+      );
+      expect(err.message).toMatch(/HTML page/);
+      expect(err.message).toMatch(/device token/);
+    });
+
+    it("clears the saved device token after detecting an HTML login response", async () => {
+      mockedRequestUrl.mockResolvedValueOnce({
+        status: 200,
+        headers: { "content-type": "text/html" },
+        text: "<!DOCTYPE html><html></html>",
+      });
+
+      const cfg = {
+        baseUrl: "https://nas.local:5001",
+        username: "user",
+        password: "pass",
+        deviceToken: "old-token",
+      };
+      const fs = new FileStation(cfg);
+
+      await expect(fs.login()).rejects.toThrow(/HTML page/);
+      // The constructor stored a reference; verify the internal config was cleared.
+      expect((fs as unknown as { config: { deviceToken?: string } }).config.deviceToken).toBeUndefined();
+    });
+
+    it("retries without the device token when DSM rejects it with code 403", async () => {
+      mockedRequestUrl
+        // First attempt: 403 because the saved device_id is no longer trusted.
+        .mockResolvedValueOnce({
+          status: 200,
+          text: JSON.stringify({ success: false, error: { code: 403 } }),
+          json: { success: false, error: { code: 403 } },
+        })
+        // Retry without device_id: success.
+        .mockResolvedValueOnce({
+          status: 200,
+          text: JSON.stringify({
+            success: true,
+            data: { sid: "new-sid", device_id: "new-token" },
+          }),
+          json: {
+            success: true,
+            data: { sid: "new-sid", device_id: "new-token" },
+          },
+        })
+        // DSM info probe (best-effort).
+        .mockResolvedValueOnce({
+          status: 200,
+          json: { success: true, data: { model: "DS", version_string: "DSM 7" } },
+        });
+
+      const fs = new FileStation({
+        baseUrl: "https://nas.local:5001",
+        username: "user",
+        password: "pass",
+        deviceToken: "expired-token",
+      });
+
+      await expect(fs.login()).resolves.toEqual({
+        sid: "new-sid",
+        deviceId: "",
+        deviceToken: "new-token",
+      });
+      // Verify the retry call did NOT include the stale device_id.
+      const secondCall = mockedRequestUrl.mock.calls[1][0];
+      expect(secondCall.url).not.toContain("device_id=expired-token");
+    });
+
+    it("throws a clear error when the post-403 retry also fails with 403", async () => {
+      mockedRequestUrl
+        .mockResolvedValueOnce({
+          status: 200,
+          text: JSON.stringify({ success: false, error: { code: 403 } }),
+          json: { success: false, error: { code: 403 } },
+        })
+        .mockResolvedValueOnce({
+          status: 200,
+          text: JSON.stringify({ success: false, error: { code: 403 } }),
+          json: { success: false, error: { code: 403 } },
+        });
+
+      const fs = new FileStation({
+        baseUrl: "https://nas.local:5001",
+        username: "user",
+        password: "pass",
+        deviceToken: "expired-token",
+      });
+
+      await expect(fs.login()).rejects.toThrow(/rejected/);
+    });
+
+    it("parseJson helper surfaces a clear error when listFolder receives an HTML body", async () => {
+      const fs = new FileStation({
+        baseUrl: "https://nas.local:5001",
+        username: "u",
+        password: "p",
+      });
+      (fs as unknown as { sid: string }).sid = "test-sid";
+
+      mockedRequestUrl.mockResolvedValueOnce({
+        status: 200,
+        text: "<html><body>Login required</body></html>",
+        // If this were touched, the test would see a different message.
+        get json() {
+          throw new Error("JSON Parse error: Unrecognized token '<'");
+        },
+      });
+
+      await expect(fs.listFolder("/root")).rejects.toThrow(/NAS returned an HTML page/);
+    });
+  });
+
   describe("listAllFiles", () => {
     function makeListResp(files: Array<{ path: string; name: string; isdir: boolean }>) {
       return {
