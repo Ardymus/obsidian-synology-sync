@@ -4,6 +4,7 @@ import { resolveQuickConnect } from "./quickconnect";
 import { SyncEngine, SyncResult } from "./sync";
 import { SynologySyncSettings, SynologySyncSettingTab, DEFAULT_SETTINGS, migrateLoadedSettings } from "./settings";
 import { debugLog, getDebugLog } from "./debug";
+import { obfuscate, deobfuscate } from "./secret-store";
 
 // UUID generator with fallbacks for older runtimes.
 // crypto.randomUUID requires iOS 15.4+ / Chromium 92+; we fall back through
@@ -73,10 +74,58 @@ export default class SynologySync extends Plugin {
 
     this.setupAutoSync();
 
-    if (this.settings.syncOnStartup && this.settings.remotePath) {
-      // Delay startup sync to let vault finish loading
-      setTimeout(() => this.runSync(), 5000);
+    if (this.settings.remotePath) {
+      // Delay so the vault can finish loading before we touch the network or
+      // emit user-facing notices.
+      setTimeout(async () => {
+        if (this.settings.syncOnStartup) {
+          await this.runSync();
+        }
+        this.checkSyncFreshness();
+      }, 5000);
     }
+  }
+
+  /**
+   * Emit a clickable "last sync was N ago" notice when the recorded
+   * `lastSync` is older than the user's configured cadence would expect.
+   * Silent failures (auth expiry, wrong remote path, transient network)
+   * otherwise produce no signal — sync just stops working with no
+   * indication.
+   *
+   * Thresholds:
+   *   - autoSync enabled (`syncInterval > 0`): stale at 2x the interval
+   *   - autoSync disabled, syncOnStartup enabled: stale at 24h since last sync
+   *   - both disabled: user owns scheduling — no warning
+   */
+  private checkSyncFreshness(): void {
+    const { lastSync, syncInterval, syncOnStartup, remotePath } = this.settings;
+    if (!remotePath) return;
+    if (lastSync === 0) return; // never synced — caller's first sync handles UX
+    if (syncInterval === 0 && !syncOnStartup) return;
+
+    const ageMs = Date.now() - lastSync;
+    const thresholdMs =
+      syncInterval > 0 ? 2 * syncInterval * 60 * 1000 : 24 * 60 * 60 * 1000;
+    if (ageMs <= thresholdMs) return;
+
+    const days = Math.floor(ageMs / (24 * 60 * 60 * 1000));
+    const hours = Math.floor((ageMs % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000));
+    const friendly = days > 0 ? `${days}d ${hours}h` : `${hours}h`;
+
+    const frag = document.createDocumentFragment();
+    frag.createEl("span", { text: `Synology Sync: last successful sync was ${friendly} ago.` });
+    frag.createEl("br");
+    frag.createEl("span", {
+      text: "Click to sync now.",
+      attr: { style: "font-size: 0.85em; opacity: 0.7;" },
+    });
+    const notice = new Notice(frag, 0); // 0 = sticky until clicked/dismissed
+    notice.noticeEl.style.cursor = "pointer";
+    notice.noticeEl.addEventListener("click", () => {
+      notice.hide();
+      this.runSync();
+    });
   }
 
   onunload() {
@@ -132,9 +181,11 @@ export default class SynologySync extends Plugin {
     return {
       baseUrl,
       username: this.settings.username,
-      password: this.settings.password,
+      // Settings stores password/deviceToken obfuscated at rest; the
+      // FileStation client always receives plaintext.
+      password: deobfuscate(this.settings.password),
       deviceId: this.settings.deviceId || undefined,
-      deviceToken: this.settings.deviceToken || undefined,
+      deviceToken: deobfuscate(this.settings.deviceToken) || undefined,
       otpCode,
       quickConnectRelay,
     };
@@ -145,10 +196,11 @@ export default class SynologySync extends Plugin {
     const fs = new FileStation(config);
     const result = await fs.login();
 
-    // If we got a new device token, save it
-    if (result.deviceToken && result.deviceToken !== this.settings.deviceToken) {
+    // If we got a new device token, save it (obfuscated). Compare against the
+    // deobfuscated stored value so we don't churn writes on every login.
+    if (result.deviceToken && result.deviceToken !== deobfuscate(this.settings.deviceToken)) {
       this.settings.deviceId = result.deviceId;
-      this.settings.deviceToken = result.deviceToken;
+      this.settings.deviceToken = obfuscate(result.deviceToken);
       await this.saveSettings();
     }
 
@@ -169,7 +221,7 @@ export default class SynologySync extends Plugin {
     await fs.logout();
 
     if (result.deviceToken) {
-      this.settings.deviceToken = result.deviceToken;
+      this.settings.deviceToken = obfuscate(result.deviceToken);
     }
     this.settings.deviceId = result.deviceId || this.settings.deviceId;
     await this.saveSettings();

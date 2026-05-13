@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+## 2026.0512.1
+
+### feat: Obfuscate credentials at rest in `data.json`
+
+`password` and `deviceToken` were previously stored in plain text. Opening `data.json` in an editor — or, more dangerously, syncing it through this plugin's own remote shard or any vault backup tool — exposed DSM credentials in clear. The values are now wrapped with a versioned obfuscation scheme (`o1:` prefix, XOR + base64) before being written to disk; the plaintext only exists in memory while building the FileStation login config.
+
+This is *obfuscation*, not encryption: anyone with both `data.json` and the plugin source can recover the plaintext. The goal is to defeat casual disclosure (editor open, screenshare, bug-report paste, vault-sync snapshot), not a determined attacker with file access. True at-rest encryption needs a user passphrase or platform keychain; Obsidian's plugin API exposes neither uniformly across desktop and mobile.
+
+- A one-time migration in `migrateLoadedSettings` promotes any pre-existing plaintext `password` or `deviceToken` on first load. Empty values stay empty.
+- The settings UI now reads/writes via `obfuscate()`/`deobfuscate()` so the password field continues to display correctly after migration.
+- `buildConfig()` and `getFileStation()` deobfuscate at the call site; the comparison for "did the device token change?" runs against the deobfuscated value to avoid write churn.
+- Threat model and rotation path documented in `src/secret-store.ts`.
+
+### feat: Surface stale-sync state to the user
+
+When the plugin's expected sync cadence is missed for an extended period — autoSync configured but the loop has stopped advancing `lastSync`, or `syncOnStartup` enabled but every startup sync has been failing — the plugin previously produced no signal. The user only discovered the issue when local edits silently failed to propagate (the failure mode that motivated this release).
+
+- On plugin load, after any `syncOnStartup` attempt completes, `checkSyncFreshness()` evaluates whether `lastSync` is older than the configured cadence expects (2x `syncInterval` if auto-sync is on, 24h if only startup-sync is on).
+- If stale, a sticky clickable Notice surfaces: `"Synology Sync: last successful sync was 5d 3h ago. Click to sync now."` Clicking dismisses the notice and triggers a manual sync.
+- Users who run manual-only sync (no interval, no startup) are not warned — they own the cadence.
+
+### feat: Validate remote folder path on demand
+
+The `remotePath` setting accepted any string, including paths that did not exist or were not readable by the configured DSM user. A misconfigured path produced silent sync failures, the same failure mode the stale-sync notice now catches downstream. A new `"Validate"` button in the Sync Target section calls `FileStation.listFolder(remotePath)` and surfaces the result as ✓/✗ with the DSM error message, catching the misconfiguration at setup time rather than at sync time.
+
+### feat: Default-exclude `.obsidian/plugins/` on fresh installs
+
+`DEFAULT_SETTINGS.excludePatterns` is now `"^\\.obsidian/plugins/"` instead of an empty string. Enabling sync on a fresh install no longer pulls foreign community-plugin binaries into the vault from a stale or unrelated remote. Existing users whose `excludePatterns` is non-empty are unaffected (the default only applies on first load); other `.obsidian/` files — `app.json`, themes, snippets, hotkeys — continue to sync normally.
+
 ## 2026.0505.1
 
 ### fix: Tombstone correctness — prevent silent data loss from stale or hostile delete-log shards

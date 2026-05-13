@@ -3,6 +3,7 @@ import {
   SynologySyncSettings,
   migrateLoadedSettings,
 } from "../src/settings";
+import { isObfuscated, deobfuscate, obfuscate } from "../src/secret-store";
 
 describe("DEFAULT_SETTINGS", () => {
   it("has syncIdentityId empty by default (bootstrapped on first load)", () => {
@@ -59,5 +60,45 @@ describe("migrateLoadedSettings", () => {
     const changed = migrateLoadedSettings(s);
     expect(changed).toBe(false);
     expect(s.tombstoneJitterMs).toBe(5000);
+  });
+
+  it("obfuscates a legacy plaintext password on first load", () => {
+    const s: SynologySyncSettings = { ...DEFAULT_SETTINGS, password: "hunter2" };
+    const changed = migrateLoadedSettings(s);
+    expect(changed).toBe(true);
+    expect(isObfuscated(s.password)).toBe(true);
+    expect(deobfuscate(s.password)).toBe("hunter2");
+  });
+
+  it("obfuscates a legacy plaintext deviceToken on first load", () => {
+    const s: SynologySyncSettings = { ...DEFAULT_SETTINGS, deviceToken: "tok_abc123" };
+    const changed = migrateLoadedSettings(s);
+    expect(changed).toBe(true);
+    expect(isObfuscated(s.deviceToken)).toBe(true);
+    expect(deobfuscate(s.deviceToken)).toBe("tok_abc123");
+  });
+
+  it("does not re-wrap an already-obfuscated password", () => {
+    const wrapped = obfuscate("hunter2");
+    const s: SynologySyncSettings = { ...DEFAULT_SETTINGS, password: wrapped };
+    const changed = migrateLoadedSettings(s);
+    expect(changed).toBe(false);
+    expect(s.password).toBe(wrapped);
+  });
+
+  it("leaves empty credentials empty (no obfuscation marker churn)", () => {
+    const s: SynologySyncSettings = { ...DEFAULT_SETTINGS };
+    const changed = migrateLoadedSettings(s);
+    expect(changed).toBe(false);
+    expect(s.password).toBe("");
+    expect(s.deviceToken).toBe("");
+  });
+});
+
+describe("DEFAULT_SETTINGS exclude patterns", () => {
+  it("excludes .obsidian/plugins/ by default", () => {
+    // Prevents fresh installs from pulling foreign plugins from a stale or
+    // unrelated remote vault on first sync.
+    expect(DEFAULT_SETTINGS.excludePatterns).toContain(".obsidian/plugins/");
   });
 });
