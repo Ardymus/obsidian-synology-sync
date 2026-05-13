@@ -3,6 +3,7 @@ import type SynologySync from "./main";
 import { resolveQuickConnect } from "./quickconnect";
 import { getDebugLog, clearDebugLog } from "./debug";
 import { FileStation, FileInfo } from "./filestation";
+import { obfuscate, deobfuscate, isObfuscated } from "./secret-store";
 
 export interface SynologySyncSettings {
   connectionType: "quickconnect" | "direct";
@@ -56,7 +57,10 @@ export const DEFAULT_SETTINGS: SynologySyncSettings = {
   syncInterval: 0,
   conflictStrategy: "newer-wins",
   deleteOrphans: false,
-  excludePatterns: "",
+  // Default-exclude plugin directories so enabling sync on a fresh install does
+  // not pull foreign plugins into the vault from a stale or unrelated remote.
+  // Vault config (`.obsidian/*.json`, themes, snippets) still syncs.
+  excludePatterns: "^\\.obsidian/plugins/",
   syncOnStartup: false,
   lastSync: 0,
   deviceId: "",
@@ -64,12 +68,43 @@ export const DEFAULT_SETTINGS: SynologySyncSettings = {
   syncIdentityId: "",
   tombstoneRetentionDays: 0,
   honorTombstoneOnRecreate: false,
-  // 30s jitter absorbs typical cross-device clock skew.  Tightening this
-  // reduces the window in which a legitimate recreate-after-delete could be
-  // mis-detected as a stale tombstone and silently deleted.
-  tombstoneJitterMs: 30000,
+  // 5s jitter absorbs realistic cross-device clock skew (Synology mtime
+  // resolution is 1 second). The prior default of 30s was too wide — it
+  // created a 30-second window where a live remote file could be treated
+  // as a stale tombstone and silently deleted.
+  tombstoneJitterMs: 5000,
   remoteAbsenceGraceCycles: 2,
 };
+
+// Legacy default that was shipped in releases prior to 2026.0505.1.
+// Used by the migration shim to distinguish "user left the old default"
+// from "user intentionally set a custom value".
+const LEGACY_TOMBSTONE_JITTER_MS = 30000;
+
+/**
+ * Applies one-time migrations to settings loaded from disk.
+ * Returns true if any value was changed (caller should persist).
+ */
+export function migrateLoadedSettings(settings: SynologySyncSettings): boolean {
+  let changed = false;
+  if (settings.tombstoneJitterMs === LEGACY_TOMBSTONE_JITTER_MS) {
+    settings.tombstoneJitterMs = DEFAULT_SETTINGS.tombstoneJitterMs;
+    changed = true;
+  }
+  // Promote any legacy plaintext credentials to the at-rest obfuscation
+  // scheme. Empty strings stay empty. Values already wrapped (`o1:...`) are
+  // left alone. See `secret-store.ts` for the threat model — this is
+  // obfuscation, not encryption.
+  if (settings.password && !isObfuscated(settings.password)) {
+    settings.password = obfuscate(settings.password);
+    changed = true;
+  }
+  if (settings.deviceToken && !isObfuscated(settings.deviceToken)) {
+    settings.deviceToken = obfuscate(settings.deviceToken);
+    changed = true;
+  }
+  return changed;
+}
 
 export class SynologySyncSettingTab extends PluginSettingTab {
   plugin: SynologySync;
@@ -185,13 +220,14 @@ export class SynologySyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Password")
+      .setDesc("Stored obfuscated in data.json (not plaintext). See README for the threat model.")
       .addText((text) => {
         text.inputEl.type = "password";
         text
           .setPlaceholder("password")
-          .setValue(this.plugin.settings.password)
+          .setValue(deobfuscate(this.plugin.settings.password))
           .onChange(async (value) => {
-            this.plugin.settings.password = value;
+            this.plugin.settings.password = obfuscate(value);
             await this.plugin.saveSettings();
           });
       });
@@ -257,6 +293,33 @@ export class SynologySyncSettingTab extends PluginSettingTab {
             this.plugin.settings.remotePath = value;
             await this.plugin.saveSettings();
           })
+      );
+
+    new Setting(containerEl)
+      .setName("Validate path")
+      .setDesc("Confirm the remote folder exists and is readable by the configured user")
+      .addButton((btn) =>
+        btn.setButtonText("Validate").onClick(async () => {
+          const path = this.plugin.settings.remotePath?.trim();
+          if (!path) {
+            new Notice("Set a remote folder path first");
+            return;
+          }
+          let fs: FileStation | null = null;
+          try {
+            new Notice("Validating remote path...");
+            fs = await this.plugin.getFileStation();
+            await fs.listFolder(path);
+            new Notice(`✓ Remote path is reachable: ${path}`);
+          } catch (e) {
+            // FileStation surfaces both DSM errors (e.g. "no permission",
+            // "folder does not exist") and transport errors with readable
+            // messages, so we can pass them straight through.
+            new Notice(`✗ Validation failed: ${(e as Error).message}`, 10000);
+          } finally {
+            if (fs) { try { await fs.logout(); } catch { /* ignore */ } }
+          }
+        })
       );
 
     new Setting(containerEl)

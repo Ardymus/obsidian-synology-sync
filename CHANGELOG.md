@@ -2,6 +2,52 @@
 
 ## [Unreleased]
 
+## 2026.0512.1
+
+### feat: Obfuscate credentials at rest in `data.json`
+
+`password` and `deviceToken` were previously stored in plain text. Opening `data.json` in an editor — or, more dangerously, syncing it through this plugin's own remote shard or any vault backup tool — exposed DSM credentials in clear. The values are now wrapped with a versioned obfuscation scheme (`o1:` prefix, XOR + base64) before being written to disk; the plaintext only exists in memory while building the FileStation login config.
+
+This is *obfuscation*, not encryption: anyone with both `data.json` and the plugin source can recover the plaintext. The goal is to defeat casual disclosure (editor open, screenshare, bug-report paste, vault-sync snapshot), not a determined attacker with file access. True at-rest encryption needs a user passphrase or platform keychain; Obsidian's plugin API exposes neither uniformly across desktop and mobile.
+
+- A one-time migration in `migrateLoadedSettings` promotes any pre-existing plaintext `password` or `deviceToken` on first load. Empty values stay empty.
+- The settings UI now reads/writes via `obfuscate()`/`deobfuscate()` so the password field continues to display correctly after migration.
+- `buildConfig()` and `getFileStation()` deobfuscate at the call site; the comparison for "did the device token change?" runs against the deobfuscated value to avoid write churn.
+- Threat model and rotation path documented in `src/secret-store.ts`.
+
+### feat: Surface stale-sync state to the user
+
+When the plugin's expected sync cadence is missed for an extended period — autoSync configured but the loop has stopped advancing `lastSync`, or `syncOnStartup` enabled but every startup sync has been failing — the plugin previously produced no signal. The user only discovered the issue when local edits silently failed to propagate (the failure mode that motivated this release).
+
+- On plugin load, after any `syncOnStartup` attempt completes, `checkSyncFreshness()` evaluates whether `lastSync` is older than the configured cadence expects (2x `syncInterval` if auto-sync is on, 24h if only startup-sync is on).
+- If stale, a sticky clickable Notice surfaces: `"Synology Sync: last successful sync was 5d 3h ago. Click to sync now."` Clicking dismisses the notice and triggers a manual sync.
+- Users who run manual-only sync (no interval, no startup) are not warned — they own the cadence.
+
+### feat: Validate remote folder path on demand
+
+The `remotePath` setting accepted any string, including paths that did not exist or were not readable by the configured DSM user. A misconfigured path produced silent sync failures, the same failure mode the stale-sync notice now catches downstream. A new `"Validate"` button in the Sync Target section calls `FileStation.listFolder(remotePath)` and surfaces the result as ✓/✗ with the DSM error message, catching the misconfiguration at setup time rather than at sync time.
+
+### feat: Default-exclude `.obsidian/plugins/` on fresh installs
+
+`DEFAULT_SETTINGS.excludePatterns` is now `"^\\.obsidian/plugins/"` instead of an empty string. Enabling sync on a fresh install no longer pulls foreign community-plugin binaries into the vault from a stale or unrelated remote. Existing users whose `excludePatterns` is non-empty are unaffected (the default only applies on first load); other `.obsidian/` files — `app.json`, themes, snippets, hotkeys — continue to sync normally.
+
+## 2026.0505.1
+
+### fix: Tombstone correctness — prevent silent data loss from stale or hostile delete-log shards
+
+- Drop the `tombstoneJitterMs` default from 30000ms to 5000ms. The 30-second window was wider than realistic cross-device clock skew and opened a 30-second band where a live remote file could be classified as a stale tombstone and deleted. A one-time settings migration rewrites the legacy 30000 value to 5000 on next load; users who set a custom value are left untouched.
+- Harden the mtime gate in `decision-table.ts` against malformed `deleted_at` values (NaN/Infinity, zero or negative, or implausibly far in the future). When a tombstone is unparseable, the gate now refuses to act on it and routes Rows 4/8/10 down the "live data wins" branch (keep-local / recreate-after-delete) rather than deleting.
+- Add cross-device purge propagation via a shared `_cleared.json` marker under `.sync-tombstones/`. When a device keeps a file via Row 6 (`keep-local-purge-tombstone`), it now records a `cleared_at` timestamp that suppresses peer devices' stale shard tombstones for that path. A subsequent genuine delete (`deleted_at > cleared_at`) still wins.
+
+### fix: Mid-sync write protection — don't overwrite or silently mark-clean files the user edited during a sync
+
+- Stamp `syncStartTs` at the top of each `sync()` run and track every stat the sync itself wrote in `syncedLocalStats`. The prev-sync snapshot now refuses to record a file as cleanly synced when its mtime postdates `syncStartTs` and does not match a stat written by this cycle — its prior history is carried forward instead, so the next cycle re-evaluates the file rather than burying the user's edit.
+- Re-read live local mtime in `downloadFile` immediately before writing. If the user edited the file between the initial scan and the download, the conflict strategy now decides: `local-wins` always skips, `newer-wins` skips iff the live local mtime exceeds the remote, and `remote-wins` always overwrites. Skipped paths land in `result.conflicts`. A residual TOCTOU window between the live-mtime read and `vault.modifyBinary` remains and is documented in code; closing it would require an Obsidian API change.
+
+### perf: Bounded-concurrency BFS for remote listing
+
+`FileStation.listAllFiles` now fans out folder listings five at a time via `Promise.allSettled` instead of walking the tree one folder per round-trip. A single failed `listFolder` (permission hiccup, transient API error) is logged and the rest of the scan continues.
+
 ## 2026.430.5
 
 ### fix: Bound QuickConnect server-info lookup — closes #25
